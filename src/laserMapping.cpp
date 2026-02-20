@@ -59,11 +59,18 @@
 #include <livox_ros_driver/CustomMsg.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+#include <std_msgs/Float64MultiArray.h>
+#include <Eigen/Eigenvalues>
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
+
+ros::Publisher pubDeg;
+double g_omega_mean = 0.0;
+double g_omega_max  = 0.0;
+double g_acc_mean   = 0.0;
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
@@ -751,12 +758,56 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         ekfom_data.h(i) = -norm_p.intensity;
     }
     solve_time += omp_get_wtime() - solve_start_;
+    {
+        // Full H is effct_feat_num x 12 (pose + extrinsic-related terms)
+        const Eigen::MatrixXd& Hfull = ekfom_data.h_x;
+
+        // Use only pose part: effct_feat_num x 6
+        // (Assumes first 6 columns correspond to pose error-state in this implementation.)
+        if (Hfull.rows() >= 6)
+        {
+            Eigen::MatrixXd Hpose = Hfull.leftCols(6);  // size: effct_feat_num x 6
+
+            // Apose = Hpose^T * Hpose / sigma^2  (sigma^2 = LASER_POINT_COV)
+            Eigen::Matrix<double, 6, 6> Apose =
+                (Hpose.transpose() * Hpose) / std::max(LASER_POINT_COV, 1e-12);
+
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(Apose);
+
+            if (es.info() == Eigen::Success)
+            {
+                Eigen::Matrix<double, 6, 1> eig = es.eigenvalues();
+                double lambda_min = eig.minCoeff();
+                double lambda_max = eig.maxCoeff();
+                double cond = lambda_max / std::max(lambda_min, 1e-12);
+
+                const double omega_mean = g_omega_mean;
+                const double omega_max  = g_omega_max;
+                const double acc_mean   = g_acc_mean;
+
+                // Publish (pose-only)
+                std_msgs::Float64MultiArray msg;
+                msg.data.resize(9);
+                msg.data[0] = Measures.lidar_beg_time;
+                msg.data[1] = static_cast<double>(effct_feat_num);
+                msg.data[2] = lambda_min;
+                msg.data[3] = lambda_max;
+                msg.data[4] = cond;
+                msg.data[5] = omega_mean;
+                msg.data[6] = omega_max;
+                msg.data[7] = acc_mean;
+                pubDeg.publish(msg);
+            }
+        }
+    }
 }
 
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "laserMapping");
     ros::NodeHandle nh;
+
+    pubDeg = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/degeneracy", 1000);
 
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
@@ -888,6 +939,41 @@ int main(int argc, char** argv)
             p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+
+            int imu_count = Measures.imu.size();
+            double omega_mean = 0.0;
+            double omega_max  = 0.0;
+            double acc_mean   = 0.0;
+
+            for (const auto& imu_msg : Measures.imu)
+            {
+                double wx = imu_msg->angular_velocity.x;
+                double wy = imu_msg->angular_velocity.y;
+                double wz = imu_msg->angular_velocity.z;
+
+                double ax = imu_msg->linear_acceleration.x;
+                double ay = imu_msg->linear_acceleration.y;
+                double az = imu_msg->linear_acceleration.z;
+
+                double omega_norm = sqrt(wx*wx + wy*wy + wz*wz);
+                double acc_norm   = sqrt(ax*ax + ay*ay + az*az);
+                // double acc_dyn = std::abs(acc_norm - 9.81);
+
+                omega_mean += omega_norm;
+                acc_mean   += acc_norm;
+
+                omega_max = std::max(omega_max, omega_norm);
+            }
+
+            if (imu_count > 0)
+            {
+                omega_mean /= imu_count;
+                acc_mean   /= imu_count;
+            }
+
+            g_omega_mean = omega_mean;
+            g_omega_max  = omega_max;
+            g_acc_mean   = acc_mean;
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
