@@ -72,6 +72,17 @@ double g_omega_mean = 0.0;
 double g_omega_max  = 0.0;
 double g_acc_mean   = 0.0;
 
+//*** for degeneracy detection ***//
+std::mutex g_info_mtx;
+Eigen::Matrix<double, 6, 6> g_info_lidar_pose = Eigen::Matrix<double,6,6>::Zero();
+double g_ratio_rt = 0.0;
+double g_last_lidar_time_for_info = 0.0;
+int g_last_effct_feat_num = 0;
+bool g_have_info_lidar_pose = false;
+/*******************************/
+
+ros::Publisher pubDegPost;
+
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN], s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
@@ -768,11 +779,82 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         {
             Eigen::MatrixXd Hpose = Hfull.leftCols(6);  // size: effct_feat_num x 6
 
+            // Code to check the norms of Hpose columns for degeneracy analysis (uncomment for debugging):
+
+            // static int dbg_counter = 0;
+            // dbg_counter++;
+
+            // // Print every N frames to avoid spam
+            // const int PRINT_EVERY = 20;
+            // if (dbg_counter % PRINT_EVERY == 0)
+            // {
+            //     Eigen::Matrix<double, 1, 6> col_norms;
+            //     for (int c = 0; c < 6; ++c)
+            //     {
+            //         col_norms(c) = Hpose.col(c).norm();   // L2 norm of column c
+            //     }
+
+            //     // Also useful: RMS norm (norm / sqrt(rows))
+            //     double n = static_cast<double>(Hpose.rows());
+            //     if (n < 1.0) n = 1.0;
+
+            //     Eigen::Matrix<double, 1, 6> col_rms =
+            //         col_norms / std::sqrt(n);
+
+            //     ROS_INFO_STREAM(
+            //         "[Degeneracy dbg] Hpose rows=" << Hpose.rows()
+            //         << " col_norms=[t_x t_y t_z r_x r_y r_z]=" << col_norms
+            //         << " col_rms=" << col_rms
+            //     );
+
+            //     double n_rows = static_cast<double>(Hpose.rows());
+            //     if (n_rows < 1.0) n_rows = 1.0;
+
+            //     double t_scale = Hpose.leftCols(3).norm() / std::sqrt(n_rows);
+            //     double r_scale = Hpose.rightCols(3).norm() / std::sqrt(n_rows);
+
+            //     ROS_WARN_STREAM("[Degeneracy dbg] rms Frobenius: t=" << t_scale
+            //                     << " r=" << r_scale
+            //                     << " ratio r/t=" << (r_scale / std::max(t_scale, 1e-12)));
+            // }
+
+            // Scale the rotation part of H to balance the translation and rotation contributions in the eigenvalue analysis.
+            double L = 10.0; // try 5, 10, 20 based on your environment / LiDAR range
+            Eigen::MatrixXd Hscaled = Hpose;
+            Hscaled.block(0, 3, Hpose.rows(), 3) /= L;  // scale r_x r_y r_z
+
+            // Computing the eigenvalues of information matrix Apose
+            Eigen::Matrix<double,6,6> Apose =
+                (Hscaled.transpose() * Hscaled) / std::max(LASER_POINT_COV, 1e-12);
+                
+            // Original (unscaled) version for reference:
             // Apose = Hpose^T * Hpose / sigma^2  (sigma^2 = LASER_POINT_COV)
-            Eigen::Matrix<double, 6, 6> Apose =
-                (Hpose.transpose() * Hpose) / std::max(LASER_POINT_COV, 1e-12);
+            // Eigen::Matrix<double, 6, 6> Apose =
+                // (Hpose.transpose() * Hpose) / std::max(LASER_POINT_COV, 1e-12);
 
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(Apose);
+
+            // --- Store LiDAR pose information for posterior analysis ---
+            // NOTE: use the UN-SCALED Hpose here if you want a physically meaningful info matrix.
+            Eigen::Matrix<double, 6, 6> info_lidar_pose =
+                (Hpose.transpose() * Hpose) / std::max(LASER_POINT_COV, 1e-12);;
+
+            // Also store r/t ratio (you already compute it for printing)
+            double n_rows = static_cast<double>(Hpose.rows());
+            if (n_rows < 1.0) n_rows = 1.0;
+
+            double t_scale = Hpose.leftCols(3).norm() / std::sqrt(n_rows);
+            double r_scale = Hpose.rightCols(3).norm() / std::sqrt(n_rows);
+            double ratio_rt = r_scale / std::max(t_scale, 1e-12);
+
+            {
+                std::lock_guard<std::mutex> lk(g_info_mtx);
+                g_info_lidar_pose = info_lidar_pose;
+                g_ratio_rt = ratio_rt;
+                g_last_lidar_time_for_info = Measures.lidar_beg_time;
+                g_last_effct_feat_num = effct_feat_num;
+                g_have_info_lidar_pose = true;
+            }
 
             if (es.info() == Eigen::Success)
             {
@@ -808,6 +890,7 @@ int main(int argc, char** argv)
     ros::NodeHandle nh;
 
     pubDeg = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/degeneracy", 1000);
+    pubDegPost = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/degeneracy_post", 1000);   
 
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
@@ -1044,6 +1127,68 @@ int main(int argc, char** argv)
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+            
+            // ---- Posterior info: Lambda_post = P_pose^{-1} + info_lidar_pose ----
+            Eigen::Matrix<double, 6, 6> info_lidar_pose;
+            double ratio_rt = 0.0;
+            double t_meas = 0.0;
+            int eff_feat = 0;
+            bool have_info = false;
+
+            {
+                std::lock_guard<std::mutex> lk(g_info_mtx);
+                have_info = g_have_info_lidar_pose;
+                if (have_info)
+                {
+                    info_lidar_pose = g_info_lidar_pose;
+                    ratio_rt = g_ratio_rt;
+                    t_meas = g_last_lidar_time_for_info;
+                    eff_feat = g_last_effct_feat_num;
+                }
+            }
+
+            if (have_info)
+            {
+                auto Pfull = kf.get_P();
+
+                // Pose covariance in the filter state (first 6x6 usually = [rot(3), pos(3)])
+                Eigen::Matrix<double, 6, 6> P_pose_rotpos = Pfull.block<6,6>(0,0);
+
+                // Your Hpose columns are [pos(3), rot(3)] because you build h_x as:
+                // [norm(3), A(3), ...] where A is rotation part.
+                // So we permute [rot,pos] -> [pos,rot] to match Hpose ordering.
+                Eigen::Matrix<double, 6, 6> T = Eigen::Matrix<double,6,6>::Zero();
+                T.block<3,3>(0,3) = Eigen::Matrix3d::Identity(); // pos <- pos part
+                T.block<3,3>(3,0) = Eigen::Matrix3d::Identity(); // rot <- rot part
+
+                Eigen::Matrix<double, 6, 6> P_pose_posrot = T * P_pose_rotpos * T.transpose();
+
+                // Prior information (more stable than inverse())
+                Eigen::Matrix<double, 6, 6> info_prior_pose =
+                    P_pose_posrot.ldlt().solve(Eigen::Matrix<double,6,6>::Identity());
+
+                Eigen::Matrix<double, 6, 6> info_post_pose = info_prior_pose + info_lidar_pose;
+
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double,6,6>> es(info_post_pose);
+                if (es.info() == Eigen::Success)
+                {
+                    auto eig = es.eigenvalues();
+                    double lam_min = eig.minCoeff();
+                    double lam_max = eig.maxCoeff();
+                    double cond_post = lam_max / std::max(lam_min, 1e-12);
+
+                    std_msgs::Float64MultiArray msg;
+                    msg.data.resize(6);
+                    msg.data[0] = t_meas;
+                    msg.data[1] = static_cast<double>(eff_feat);
+                    msg.data[2] = lam_min;
+                    msg.data[3] = lam_max;
+                    msg.data[4] = cond_post;
+                    msg.data[5] = ratio_rt;
+                    pubDegPost.publish(msg);
+                }
+            }
+
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
