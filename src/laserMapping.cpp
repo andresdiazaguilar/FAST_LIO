@@ -74,11 +74,11 @@ double g_acc_mean   = 0.0;
 
 //*** for degeneracy detection ***//
 std::mutex g_info_mtx;
-Eigen::Matrix<double, 6, 6> g_info_lidar_pose = Eigen::Matrix<double,6,6>::Zero();
+Eigen::Matrix<double, 6, 6> g_Apose = Eigen::Matrix<double,6,6>::Zero();
 double g_ratio_rt = 0.0;
 double g_last_lidar_time_for_info = 0.0;
 int g_last_effct_feat_num = 0;
-bool g_have_info_lidar_pose = false;
+bool g_have_Apose = false;
 /*******************************/
 
 ros::Publisher pubDegPost;
@@ -822,24 +822,19 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             double L = 10.0; // try 5, 10, 20 based on your environment / LiDAR range
             Eigen::MatrixXd Hscaled = Hpose;
             Hscaled.block(0, 3, Hpose.rows(), 3) /= L;  // scale r_x r_y r_z
-
-            // Computing the eigenvalues of information matrix Apose
-            Eigen::Matrix<double,6,6> Apose =
-                (Hscaled.transpose() * Hscaled) / std::max(LASER_POINT_COV, 1e-12);
                 
-            // Original (unscaled) version for reference:
             // Apose = Hpose^T * Hpose / sigma^2  (sigma^2 = LASER_POINT_COV)
-            // Eigen::Matrix<double, 6, 6> Apose =
-                // (Hpose.transpose() * Hpose) / std::max(LASER_POINT_COV, 1e-12);
+            Eigen::Matrix<double, 6, 6> Apose =
+                (Hpose.transpose() * Hpose) / std::max(LASER_POINT_COV, 1e-12);
 
-            Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(Apose);
+            // Ascaled: Apose with Hscaled (scaled rotation part)
+            Eigen::Matrix<double,6,6> Ascaled =
+                (Hscaled.transpose() * Hscaled) / std::max(LASER_POINT_COV, 1e-12);
 
-            // --- Store LiDAR pose information for posterior analysis ---
-            // NOTE: use the UN-SCALED Hpose here if you want a physically meaningful info matrix.
-            Eigen::Matrix<double, 6, 6> info_lidar_pose =
-                (Hpose.transpose() * Hpose) / std::max(LASER_POINT_COV, 1e-12);;
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(Apose);      // eigenvalues of Apose
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es_scaled(Ascaled); // eigenvalues of Ascaled
 
-            // Also store r/t ratio (you already compute it for printing)
+            // Compute r/t ratio (rotation vs translation contribution)
             double n_rows = static_cast<double>(Hpose.rows());
             if (n_rows < 1.0) n_rows = 1.0;
 
@@ -849,19 +844,24 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
             {
                 std::lock_guard<std::mutex> lk(g_info_mtx);
-                g_info_lidar_pose = info_lidar_pose;
+                g_Apose = Apose;
                 g_ratio_rt = ratio_rt;
                 g_last_lidar_time_for_info = Measures.lidar_beg_time;
                 g_last_effct_feat_num = effct_feat_num;
-                g_have_info_lidar_pose = true;
+                g_have_Apose = true;
             }
 
-            if (es.info() == Eigen::Success)
+            if (es.info() == Eigen::Success && es_scaled.info() == Eigen::Success)
             {
                 Eigen::Matrix<double, 6, 1> eig = es.eigenvalues();
                 double lambda_min = eig.minCoeff();
                 double lambda_max = eig.maxCoeff();
                 double cond = lambda_max / std::max(lambda_min, 1e-12);
+
+                Eigen::Matrix<double, 6, 1> eig_scaled = es_scaled.eigenvalues();
+                double lambda_scaled_min = eig_scaled.minCoeff();
+                double lambda_scaled_max = eig_scaled.maxCoeff();
+                double cond_scaled = lambda_scaled_max / std::max(lambda_scaled_min, 1e-12);
 
                 const double omega_mean = g_omega_mean;
                 const double omega_max  = g_omega_max;
@@ -869,7 +869,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
                 // Publish (pose-only)
                 std_msgs::Float64MultiArray msg;
-                msg.data.resize(9);
+                msg.data.resize(11);
                 msg.data[0] = Measures.lidar_beg_time;
                 msg.data[1] = static_cast<double>(effct_feat_num);
                 msg.data[2] = lambda_min;
@@ -878,6 +878,9 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 msg.data[5] = omega_mean;
                 msg.data[6] = omega_max;
                 msg.data[7] = acc_mean;
+                msg.data[8] = lambda_scaled_min;
+                msg.data[9] = lambda_scaled_max;
+                msg.data[10] = cond_scaled;
                 pubDeg.publish(msg);
             }
         }
@@ -1128,8 +1131,7 @@ int main(int argc, char** argv)
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
             
-            // ---- Posterior info: Lambda_post = P_pose^{-1} + info_lidar_pose ----
-            Eigen::Matrix<double, 6, 6> info_lidar_pose;
+            // ---- Posterior info from post-update covariance: Lambda_post = P_pose^{-1} ----
             double ratio_rt = 0.0;
             double t_meas = 0.0;
             int eff_feat = 0;
@@ -1137,10 +1139,9 @@ int main(int argc, char** argv)
 
             {
                 std::lock_guard<std::mutex> lk(g_info_mtx);
-                have_info = g_have_info_lidar_pose;
+                have_info = g_have_Apose;
                 if (have_info)
                 {
-                    info_lidar_pose = g_info_lidar_pose;
                     ratio_rt = g_ratio_rt;
                     t_meas = g_last_lidar_time_for_info;
                     eff_feat = g_last_effct_feat_num;
@@ -1151,23 +1152,12 @@ int main(int argc, char** argv)
             {
                 auto Pfull = kf.get_P();
 
-                // Pose covariance in the filter state (first 6x6 usually = [rot(3), pos(3)])
-                Eigen::Matrix<double, 6, 6> P_pose_rotpos = Pfull.block<6,6>(0,0);
+                // Pose covariance in the filter state, aligned with Hpose ordering: [pos(3), rot(3)].
+                Eigen::Matrix<double, 6, 6> P_pose = Pfull.block<6,6>(0,0);
 
-                // Your Hpose columns are [pos(3), rot(3)] because you build h_x as:
-                // [norm(3), A(3), ...] where A is rotation part.
-                // So we permute [rot,pos] -> [pos,rot] to match Hpose ordering.
-                Eigen::Matrix<double, 6, 6> T = Eigen::Matrix<double,6,6>::Zero();
-                T.block<3,3>(0,3) = Eigen::Matrix3d::Identity(); // pos <- pos part
-                T.block<3,3>(3,0) = Eigen::Matrix3d::Identity(); // rot <- rot part
-
-                Eigen::Matrix<double, 6, 6> P_pose_posrot = T * P_pose_rotpos * T.transpose();
-
-                // Prior information (more stable than inverse())
-                Eigen::Matrix<double, 6, 6> info_prior_pose =
-                    P_pose_posrot.ldlt().solve(Eigen::Matrix<double,6,6>::Identity());
-
-                Eigen::Matrix<double, 6, 6> info_post_pose = info_prior_pose + info_lidar_pose;
+                // Posterior information (more stable than inverse()).
+                Eigen::Matrix<double, 6, 6> info_post_pose =
+                    P_pose.ldlt().solve(Eigen::Matrix<double,6,6>::Identity());
 
                 Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double,6,6>> es(info_post_pose);
                 if (es.info() == Eigen::Success)
