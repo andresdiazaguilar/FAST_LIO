@@ -39,6 +39,8 @@
 #include <fstream>
 #include <csignal>
 #include <unistd.h>
+#include <algorithm>
+#include <limits>
 #include <Python.h>
 #include <so3_math.h>
 #include <ros/ros.h>
@@ -60,6 +62,7 @@
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 #include <std_msgs/Float64MultiArray.h>
+#include <std_msgs/Float64.h>
 #include <Eigen/Eigenvalues>
 
 #define INIT_TIME           (0.1)
@@ -68,9 +71,13 @@
 #define PUBFRAME_PERIOD     (20)
 
 ros::Publisher pubDeg;
-double g_omega_mean = 0.0;
-double g_omega_max  = 0.0;
-double g_acc_mean   = 0.0;
+ros::Publisher pubInlierRatio;
+ros::Publisher pubResidualStats;
+ros::Publisher pubGyroBias;
+ros::Publisher pubAccelBias;
+ros::Publisher pubGravityEstimate;
+double g_omega_norm_mean = 0.0;
+double g_acc_norm_mean   = 0.0;
 
 //*** for degeneracy detection ***//
 std::mutex g_info_mtx;
@@ -653,6 +660,25 @@ void publish_path(const ros::Publisher pubPath)
     }
 }
 
+double percentile_from_sorted(const std::vector<float> &vals_sorted, const double q)
+{
+    if (vals_sorted.empty())
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const double q_clamped = std::max(0.0, std::min(1.0, q));
+    const double idx = q_clamped * static_cast<double>(vals_sorted.size() - 1);
+    const size_t lo = static_cast<size_t>(std::floor(idx));
+    const size_t hi = static_cast<size_t>(std::ceil(idx));
+    if (lo == hi)
+    {
+        return static_cast<double>(vals_sorted[lo]);
+    }
+    const double w_hi = idx - static_cast<double>(lo);
+    const double w_lo = 1.0 - w_hi;
+    return w_lo * static_cast<double>(vals_sorted[lo]) + w_hi * static_cast<double>(vals_sorted[hi]);
+}
+
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
@@ -711,6 +737,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     }
     
     effct_feat_num = 0;
+    std::vector<float> residuals_effective;
+    residuals_effective.reserve(feats_down_size);
 
     for (int i = 0; i < feats_down_size; i++)
     {
@@ -719,9 +747,36 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
             corr_normvect->points[effct_feat_num] = normvec->points[i];
             total_residual += res_last[i];
+            residuals_effective.push_back(res_last[i]);
             effct_feat_num ++;
         }
     }
+
+    const double inlier_ratio = feats_down_size > 0 ?
+        static_cast<double>(effct_feat_num) / static_cast<double>(feats_down_size) : 0.0;
+    std_msgs::Float64MultiArray inlier_msg;
+    inlier_msg.data.resize(2);
+    inlier_msg.data[0] = Measures.lidar_beg_time;
+    inlier_msg.data[1] = inlier_ratio;
+    pubInlierRatio.publish(inlier_msg);
+
+    double residual_median = std::numeric_limits<double>::quiet_NaN();
+    double residual_p95 = std::numeric_limits<double>::quiet_NaN();
+    if (!residuals_effective.empty())
+    {
+        std::sort(residuals_effective.begin(), residuals_effective.end());
+        residual_median = percentile_from_sorted(residuals_effective, 0.5);
+        residual_p95 = percentile_from_sorted(residuals_effective, 0.95);
+    }
+
+    std_msgs::Float64MultiArray residual_msg;
+    residual_msg.data.resize(4);
+    residual_msg.data[0] = Measures.lidar_beg_time;
+    residual_msg.data[1] = residual_median;
+    residual_msg.data[2] = residual_p95;
+    residual_msg.data[3] = residuals_effective.empty() ? std::numeric_limits<double>::quiet_NaN() :
+        total_residual / static_cast<double>(residuals_effective.size());
+    pubResidualStats.publish(residual_msg);
 
     if (effct_feat_num < 1)
     {
@@ -863,9 +918,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 double lambda_scaled_max = eig_scaled.maxCoeff();
                 double cond_scaled = lambda_scaled_max / std::max(lambda_scaled_min, 1e-12);
 
-                const double omega_mean = g_omega_mean;
-                const double omega_max  = g_omega_max;
-                const double acc_mean   = g_acc_mean;
+                const double omega_norm_mean = g_omega_norm_mean;
+                const double acc_norm_mean   = g_acc_norm_mean;
 
                 // Publish (pose-only)
                 std_msgs::Float64MultiArray msg;
@@ -875,9 +929,9 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 msg.data[2] = lambda_min;
                 msg.data[3] = lambda_max;
                 msg.data[4] = cond;
-                msg.data[5] = omega_mean;
-                msg.data[6] = omega_max;
-                msg.data[7] = acc_mean;
+                msg.data[5] = omega_norm_mean;
+                msg.data[6] = acc_norm_mean;
+                msg.data[7] = std::numeric_limits<double>::quiet_NaN();
                 msg.data[8] = lambda_scaled_min;
                 msg.data[9] = lambda_scaled_max;
                 msg.data[10] = cond_scaled;
@@ -894,6 +948,11 @@ int main(int argc, char** argv)
 
     pubDeg = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/degeneracy", 1000);
     pubDegPost = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/degeneracy_post", 1000);   
+    pubInlierRatio = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/inlier_ratio", 1000);
+    pubResidualStats = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/residual_stats", 1000);
+    pubGyroBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gyro_bias", 1000);
+    pubAccelBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/accel_bias", 1000);
+    pubGravityEstimate = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gravity_estimate", 1000);
 
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
@@ -1027,9 +1086,8 @@ int main(int argc, char** argv)
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
             int imu_count = Measures.imu.size();
-            double omega_mean = 0.0;
-            double omega_max  = 0.0;
-            double acc_mean   = 0.0;
+            double omega_norm_sum = 0.0;
+            double acc_norm_sum   = 0.0;
 
             for (const auto& imu_msg : Measures.imu)
             {
@@ -1041,25 +1099,24 @@ int main(int argc, char** argv)
                 double ay = imu_msg->linear_acceleration.y;
                 double az = imu_msg->linear_acceleration.z;
 
-                double omega_norm = sqrt(wx*wx + wy*wy + wz*wz);
-                double acc_norm   = sqrt(ax*ax + ay*ay + az*az);
-                // double acc_dyn = std::abs(acc_norm - 9.81);
+                double omega_norm_i = sqrt(wx*wx + wy*wy + wz*wz);
+                double acc_norm_i   = sqrt(ax*ax + ay*ay + az*az);
+                // double acc_dyn = std::abs(acc_norm_i - 9.81);
 
-                omega_mean += omega_norm;
-                acc_mean   += acc_norm;
-
-                omega_max = std::max(omega_max, omega_norm);
+                omega_norm_sum += omega_norm_i;
+                acc_norm_sum   += acc_norm_i;
             }
 
+            double omega_norm_mean = std::numeric_limits<double>::quiet_NaN();
+            double acc_norm_mean   = std::numeric_limits<double>::quiet_NaN();
             if (imu_count > 0)
             {
-                omega_mean /= imu_count;
-                acc_mean   /= imu_count;
+                omega_norm_mean = omega_norm_sum / imu_count;
+                acc_norm_mean   = acc_norm_sum / imu_count;
             }
 
-            g_omega_mean = omega_mean;
-            g_omega_max  = omega_max;
-            g_acc_mean   = acc_mean;
+            g_omega_norm_mean = omega_norm_mean;
+            g_acc_norm_mean   = acc_norm_mean;
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
@@ -1186,6 +1243,36 @@ int main(int argc, char** argv)
             geoQuat.y = state_point.rot.coeffs()[1];
             geoQuat.z = state_point.rot.coeffs()[2];
             geoQuat.w = state_point.rot.coeffs()[3];
+
+            std_msgs::Float64MultiArray gyro_bias_msg;
+            gyro_bias_msg.data.resize(5);
+            gyro_bias_msg.data[0] = lidar_end_time;
+            gyro_bias_msg.data[1] = state_point.bg(0);
+            gyro_bias_msg.data[2] = state_point.bg(1);
+            gyro_bias_msg.data[3] = state_point.bg(2);
+            gyro_bias_msg.data[4] = state_point.bg.norm();
+            pubGyroBias.publish(gyro_bias_msg);
+
+            std_msgs::Float64MultiArray accel_bias_msg;
+            accel_bias_msg.data.resize(5);
+            accel_bias_msg.data[0] = lidar_end_time;
+            accel_bias_msg.data[1] = state_point.ba(0);
+            accel_bias_msg.data[2] = state_point.ba(1);
+            accel_bias_msg.data[3] = state_point.ba(2);
+            accel_bias_msg.data[4] = state_point.ba.norm();
+            pubAccelBias.publish(accel_bias_msg);
+
+            std_msgs::Float64MultiArray gravity_msg;
+            gravity_msg.data.resize(5);
+            const double gx = state_point.grav[0];
+            const double gy = state_point.grav[1];
+            const double gz = state_point.grav[2];
+            gravity_msg.data[0] = lidar_end_time;
+            gravity_msg.data[1] = gx;
+            gravity_msg.data[2] = gy;
+            gravity_msg.data[3] = gz;
+            gravity_msg.data[4] = std::sqrt(gx * gx + gy * gy + gz * gz);
+            pubGravityEstimate.publish(gravity_msg);
 
             double t_update_end = omp_get_wtime();
 

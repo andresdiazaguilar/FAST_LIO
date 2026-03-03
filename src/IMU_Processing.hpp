@@ -358,6 +358,17 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
     /// The very first lidar frame
     IMU_init(meas, kf_state, init_iter_num);
 
+        if (mean_gyr.norm() > 0.1) {
+            ROS_WARN(
+                "IMU Initializing: mean gyr too large: %.6f %.6f %.6f",
+                mean_gyr[0],
+                mean_gyr[1],
+                mean_gyr[2]
+            );
+            b_first_frame_ = true;
+            return;
+        }
+
     imu_need_init_ = true;
     
     last_imu_   = meas.imu.back();
