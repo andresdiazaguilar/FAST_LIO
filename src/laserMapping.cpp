@@ -41,6 +41,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <limits>
+#include <numeric>
 #include <Python.h>
 #include <so3_math.h>
 #include <ros/ros.h>
@@ -76,6 +77,7 @@ ros::Publisher pubResidualStats;
 ros::Publisher pubGyroBias;
 ros::Publisher pubAccelBias;
 ros::Publisher pubGravityEstimate;
+ros::Publisher pubCornerFeatureCount;
 double g_omega_norm_mean = 0.0;
 double g_acc_norm_mean   = 0.0;
 double g_acc_norm_no_grav_mean = 0.0;
@@ -117,6 +119,7 @@ double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int    iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
+int    corner_feature_count = 0;
 bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
@@ -680,6 +683,78 @@ double percentile_from_sorted(const std::vector<float> &vals_sorted, const doubl
     return w_lo * static_cast<double>(vals_sorted[lo]) + w_hi * static_cast<double>(vals_sorted[hi]);
 }
 
+int estimate_corner_feature_count(const PointCloudXYZI::Ptr &cloud, const float curvature_threshold = 0.1f, const int suppress_window = 5)
+{
+    if (!cloud)
+    {
+        return 0;
+    }
+
+    const int cloud_size = static_cast<int>(cloud->points.size());
+    if (cloud_size < 11)
+    {
+        return 0;
+    }
+
+    std::vector<float> cloud_curvature(cloud_size, 0.0f);
+    std::vector<uint8_t> picked(cloud_size, 0);
+
+    for (int i = 5; i < cloud_size - 5; ++i)
+    {
+        const auto &p = cloud->points;
+        const float diff_x = p[i - 5].x + p[i - 4].x + p[i - 3].x + p[i - 2].x + p[i - 1].x
+                           - 10.0f * p[i].x
+                           + p[i + 1].x + p[i + 2].x + p[i + 3].x + p[i + 4].x + p[i + 5].x;
+        const float diff_y = p[i - 5].y + p[i - 4].y + p[i - 3].y + p[i - 2].y + p[i - 1].y
+                           - 10.0f * p[i].y
+                           + p[i + 1].y + p[i + 2].y + p[i + 3].y + p[i + 4].y + p[i + 5].y;
+        const float diff_z = p[i - 5].z + p[i - 4].z + p[i - 3].z + p[i - 2].z + p[i - 1].z
+                           - 10.0f * p[i].z
+                           + p[i + 1].z + p[i + 2].z + p[i + 3].z + p[i + 4].z + p[i + 5].z;
+        cloud_curvature[i] = diff_x * diff_x + diff_y * diff_y + diff_z * diff_z;
+    }
+
+    std::vector<int> order(cloud_size);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&cloud_curvature](const int a, const int b) {
+        return cloud_curvature[a] > cloud_curvature[b];
+    });
+
+    int corner_count = 0;
+    for (const int idx : order)
+    {
+        if (idx < 5 || idx >= cloud_size - 5)
+        {
+            continue;
+        }
+        if (picked[idx] != 0)
+        {
+            continue;
+        }
+        if (cloud_curvature[idx] <= curvature_threshold)
+        {
+            break;
+        }
+
+        ++corner_count;
+        picked[idx] = 1;
+
+        for (int k = 1; k <= suppress_window; ++k)
+        {
+            if (idx + k < cloud_size)
+            {
+                picked[idx + k] = 1;
+            }
+            if (idx - k >= 0)
+            {
+                picked[idx - k] = 1;
+            }
+        }
+    }
+
+    return corner_count;
+}
+
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
@@ -956,6 +1031,7 @@ int main(int argc, char** argv)
     pubGyroBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gyro_bias", 1000);
     pubAccelBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/accel_bias", 1000);
     pubGravityEstimate = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gravity_estimate", 1000);
+    pubCornerFeatureCount = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/corner_feature_count", 1000);
 
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
@@ -1145,6 +1221,15 @@ int main(int argc, char** argv)
             downSizeFilterSurf.filter(*feats_down_body);
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
+            corner_feature_count = estimate_corner_feature_count(feats_down_body);
+
+            std_msgs::Float64MultiArray corner_count_msg;
+            corner_count_msg.data.resize(3);
+            corner_count_msg.data[0] = Measures.lidar_beg_time;
+            corner_count_msg.data[1] = static_cast<double>(corner_feature_count);
+            corner_count_msg.data[2] = static_cast<double>(feats_down_size);
+            pubCornerFeatureCount.publish(corner_count_msg);
+
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
