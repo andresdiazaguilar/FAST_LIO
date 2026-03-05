@@ -78,6 +78,7 @@ ros::Publisher pubAccelBias;
 ros::Publisher pubGravityEstimate;
 double g_omega_norm_mean = 0.0;
 double g_acc_norm_mean   = 0.0;
+double g_acc_norm_no_grav_mean = 0.0;
 
 //*** for degeneracy detection ***//
 std::mutex g_info_mtx;
@@ -920,10 +921,11 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
                 const double omega_norm_mean = g_omega_norm_mean;
                 const double acc_norm_mean   = g_acc_norm_mean;
+                const double acc_norm_no_gravity_mean = g_acc_norm_no_grav_mean;
 
                 // Publish (pose-only)
                 std_msgs::Float64MultiArray msg;
-                msg.data.resize(11);
+                msg.data.resize(12);
                 msg.data[0] = Measures.lidar_beg_time;
                 msg.data[1] = static_cast<double>(effct_feat_num);
                 msg.data[2] = lambda_min;
@@ -935,6 +937,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 msg.data[8] = lambda_scaled_min;
                 msg.data[9] = lambda_scaled_max;
                 msg.data[10] = cond_scaled;
+                msg.data[11] = acc_norm_no_gravity_mean;
                 pubDeg.publish(msg);
             }
         }
@@ -1088,6 +1091,7 @@ int main(int argc, char** argv)
             int imu_count = Measures.imu.size();
             double omega_norm_sum = 0.0;
             double acc_norm_sum   = 0.0;
+            double acc_norm_no_grav_sum = 0.0;
 
             for (const auto& imu_msg : Measures.imu)
             {
@@ -1101,22 +1105,29 @@ int main(int argc, char** argv)
 
                 double omega_norm_i = sqrt(wx*wx + wy*wy + wz*wz);
                 double acc_norm_i   = sqrt(ax*ax + ay*ay + az*az);
-                // double acc_dyn = std::abs(acc_norm_i - 9.81);
+                // double acc_norm_no_grav_i = std::abs(acc_norm_i - 1);
+                double acc_norm_no_grav_i = acc_norm_i - 1;
+
 
                 omega_norm_sum += omega_norm_i;
                 acc_norm_sum   += acc_norm_i;
+                acc_norm_no_grav_sum += acc_norm_no_grav_i;
             }
 
             double omega_norm_mean = std::numeric_limits<double>::quiet_NaN();
             double acc_norm_mean   = std::numeric_limits<double>::quiet_NaN();
+            double acc_norm_no_grav_mean = std::numeric_limits<double>::quiet_NaN();
+            
             if (imu_count > 0)
             {
                 omega_norm_mean = omega_norm_sum / imu_count;
                 acc_norm_mean   = acc_norm_sum / imu_count;
+                acc_norm_no_grav_mean = acc_norm_no_grav_sum / imu_count;
             }
 
             g_omega_norm_mean = omega_norm_mean;
             g_acc_norm_mean   = acc_norm_mean;
+            g_acc_norm_no_grav_mean = acc_norm_no_grav_mean;
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
