@@ -61,6 +61,7 @@
 #include <geometry_msgs/Vector3.h>
 #include <livox_ros_driver/CustomMsg.h>
 #include "preprocess.h"
+#include "CornerFeatureExtractor.hpp"
 #include <ikd-Tree/ikd_Tree.h>
 #include <std_msgs/Float64MultiArray.h>
 #include <std_msgs/Float64.h>
@@ -78,6 +79,8 @@ ros::Publisher pubGyroBias;
 ros::Publisher pubAccelBias;
 ros::Publisher pubGravityEstimate;
 ros::Publisher pubCornerFeatureCount;
+ros::Publisher pubCornerCloud;
+ros::Publisher pubSurfaceCloud;
 double g_omega_norm_mean = 0.0;
 double g_acc_norm_mean   = 0.0;
 double g_acc_norm_no_grav_mean = 0.0;
@@ -168,6 +171,7 @@ geometry_msgs::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+shared_ptr<CornerFeatureExtractor> p_corner_extractor(new CornerFeatureExtractor());
 
 void SigHandle(int sig)
 {
@@ -1032,6 +1036,8 @@ int main(int argc, char** argv)
     pubAccelBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/accel_bias", 1000);
     pubGravityEstimate = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gravity_estimate", 1000);
     pubCornerFeatureCount = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/corner_feature_count", 1000);
+    pubCornerCloud = nh.advertise<sensor_msgs::PointCloud2>("/fastlio/corner_cloud", 100);
+    pubSurfaceCloud = nh.advertise<sensor_msgs::PointCloud2>("/fastlio/surface_cloud", 100);
 
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
@@ -1066,6 +1072,30 @@ int main(int argc, char** argv)
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+
+    /*** Corner feature extractor params ***/
+    double fe_edge_threshold, fe_surf_threshold, fe_surf_leaf_size;
+    double fe_vert_bottom, fe_vert_top, fe_min_range;
+    int    fe_max_corners_per_sector, fe_num_sectors;
+    nh.param<double>("feature_extraction/edge_threshold", fe_edge_threshold, 1.0);
+    nh.param<double>("feature_extraction/surf_threshold", fe_surf_threshold, 0.1);
+    nh.param<int>("feature_extraction/max_corners_per_sector", fe_max_corners_per_sector, 20);
+    nh.param<int>("feature_extraction/num_sectors", fe_num_sectors, 6);
+    nh.param<double>("feature_extraction/surf_leaf_size", fe_surf_leaf_size, 0.4);
+    nh.param<double>("feature_extraction/sensor_min_range", fe_min_range, 0.5);
+    nh.param<double>("feature_extraction/vertical_angle_bottom", fe_vert_bottom, -15.0);
+    nh.param<double>("feature_extraction/vertical_angle_top", fe_vert_top, 15.0);
+
+    p_corner_extractor->edgeThreshold        = static_cast<float>(fe_edge_threshold);
+    p_corner_extractor->surfThreshold         = static_cast<float>(fe_surf_threshold);
+    p_corner_extractor->maxCornersPerSector   = fe_max_corners_per_sector;
+    p_corner_extractor->numSectors            = fe_num_sectors;
+    p_corner_extractor->surfLeafSize          = static_cast<float>(fe_surf_leaf_size);
+    p_corner_extractor->sensorMinRange        = static_cast<float>(fe_min_range);
+    p_corner_extractor->verticalAngleBottom   = static_cast<float>(fe_vert_bottom);
+    p_corner_extractor->verticalAngleTop      = static_cast<float>(fe_vert_top);
+    // N_SCANS is read from preprocess/scan_line and set on p_pre->N_SCANS above
+    p_corner_extractor->N_SCANS               = p_pre->N_SCANS;
 
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
@@ -1221,14 +1251,35 @@ int main(int argc, char** argv)
             downSizeFilterSurf.filter(*feats_down_body);
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
-            corner_feature_count = estimate_corner_feature_count(feats_down_body);
+
+            /*** LIO-SAM-style corner & surface feature extraction ***/
+            p_corner_extractor->extract(feats_undistort);
+            corner_feature_count = p_corner_extractor->cornerCount;
 
             std_msgs::Float64MultiArray corner_count_msg;
-            corner_count_msg.data.resize(3);
+            corner_count_msg.data.resize(5);
             corner_count_msg.data[0] = Measures.lidar_beg_time;
-            corner_count_msg.data[1] = static_cast<double>(corner_feature_count);
+            corner_count_msg.data[1] = static_cast<double>(p_corner_extractor->cornerCount);
             corner_count_msg.data[2] = static_cast<double>(feats_down_size);
+            corner_count_msg.data[3] = static_cast<double>(p_corner_extractor->surfaceCount);
+            corner_count_msg.data[4] = static_cast<double>(feats_undistort->points.size());
             pubCornerFeatureCount.publish(corner_count_msg);
+
+            // Publish corner and surface clouds for visualization
+            if (scan_pub_en)
+            {
+                sensor_msgs::PointCloud2 cornerMsg;
+                pcl::toROSMsg(*p_corner_extractor->cornerCloud, cornerMsg);
+                cornerMsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+                cornerMsg.header.frame_id = "body";
+                pubCornerCloud.publish(cornerMsg);
+
+                sensor_msgs::PointCloud2 surfMsg;
+                pcl::toROSMsg(*p_corner_extractor->surfaceCloud, surfMsg);
+                surfMsg.header.stamp = ros::Time().fromSec(lidar_end_time);
+                surfMsg.header.frame_id = "body";
+                pubSurfaceCloud.publish(surfMsg);
+            }
 
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
