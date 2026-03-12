@@ -1083,8 +1083,8 @@ int main(int argc, char** argv)
     nh.param<int>("feature_extraction/num_sectors", fe_num_sectors, 6);
     nh.param<double>("feature_extraction/surf_leaf_size", fe_surf_leaf_size, 0.4);
     nh.param<double>("feature_extraction/sensor_min_range", fe_min_range, 0.5);
-    nh.param<double>("feature_extraction/vertical_angle_bottom", fe_vert_bottom, -15.0);
-    nh.param<double>("feature_extraction/vertical_angle_top", fe_vert_top, 15.0);
+    nh.param<double>("feature_extraction/vertical_angle_bottom", fe_vert_bottom, -7.0);
+    nh.param<double>("feature_extraction/vertical_angle_top", fe_vert_top, 52.0);
 
     p_corner_extractor->edgeThreshold        = static_cast<float>(fe_edge_threshold);
     p_corner_extractor->surfThreshold         = static_cast<float>(fe_surf_threshold);

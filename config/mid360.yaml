@@ -34,13 +34,13 @@ pcd_save:
     interval: -1                 # how many LiDAR frames saved in each pcd file; 
                                  # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
 
-# New parameters for corner feature extraction
-feature_extraction:
-    edge_threshold: 1.0          # curvature threshold for corners
-    surf_threshold: 0.1          # curvature threshold for surfaces
-    max_corners_per_sector: 20   # max corners per sector per ring
-    num_sectors: 6               # azimuthal sectors per ring
-    surf_leaf_size: 0.4          # voxel size for surface downsampling
-    sensor_min_range: 0.5        # blind zone (m)
-    vertical_angle_bottom: -15.0 # sensor vertical FOV bottom (deg)
-    vertical_angle_top: 15.0     # sensor vertical FOV top (deg)
+# # New parameters for corner feature extraction
+# feature_extraction:
+#     edge_threshold: 1.0          # curvature threshold for corners
+#     surf_threshold: 0.1          # curvature threshold for surfaces
+#     max_corners_per_sector: 20   # max corners per sector per ring
+#     num_sectors: 6               # azimuthal sectors per ring
+#     surf_leaf_size: 0.4          # voxel size for surface downsampling
+#     sensor_min_range: 0.5        # blind zone (m)
+#     vertical_angle_bottom: -15.0 # sensor vertical FOV bottom (deg)
+#     vertical_angle_top: 15.0     # sensor vertical FOV top (deg)
