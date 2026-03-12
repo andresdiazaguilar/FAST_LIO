@@ -64,6 +64,7 @@
 #include <std_msgs/Float64MultiArray.h>
 #include <std_msgs/Float64.h>
 #include <Eigen/Eigenvalues>
+#include "structural_diagnostics.h"
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -90,6 +91,9 @@ bool g_have_Apose = false;
 /*******************************/
 
 ros::Publisher pubDegPost;
+
+// ---- Structural diagnostics (edge / plane counter) ----
+StructuralDiagnostics struct_diag;
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
@@ -957,6 +961,9 @@ int main(int argc, char** argv)
     pubAccelBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/accel_bias", 1000);
     pubGravityEstimate = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gravity_estimate", 1000);
 
+    // ---- Structural diagnostics setup ----
+    struct_diag.init(nh);
+
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
     nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
@@ -1193,7 +1200,10 @@ int main(int argc, char** argv)
             bool nearest_search_en = true; //
 
             t2 = omp_get_wtime();
-            
+
+            /*** Structural feature diagnostics (edge / plane counts) ***/
+            struct_diag.analyze(feats_down_body, Measures.lidar_beg_time);
+
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
