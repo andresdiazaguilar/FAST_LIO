@@ -2,7 +2,9 @@ struct_diag:
   enable: true              # set false to disable entirely (zero overhead)
   k_neighbors: 10           # neighborhood size for PCA
   min_range: 0.5            # ignore points closer than this (meters)
-  edge_thresh: 10.0         # λ1/λ2 ratio above this → edge
-  plane_thresh: 10.0        # λ2/λ3 ratio above this → plane candidate
-  plane_upper_thresh: 3.0   # λ1/λ2 must be BELOW this for plane (rejects edges)
+  # edge_thresh: 0.1          # λ2/λ3 ratio BELOW this → edge  (1/10)
+  # plane_thresh: 0.1         # λ1/λ2 ratio BELOW this → plane candidate  (1/10)
+  edge_thresh: 0.1          # λ2/λ3 ratio BELOW this → edge  (1/10)
+  plane_thresh: 0.2         # λ1/λ2 ratio BELOW this → plane candidate  (1/10)
+  plane_upper_thresh: 0.333333  # λ2/λ3 must be ABOVE this for plane  (1/3)
   eps: 1e-6                 # numerical epsilon

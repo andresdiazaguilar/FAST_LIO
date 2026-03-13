@@ -3,11 +3,11 @@
 //
 // For each point, find k nearest neighbors in the same frame (KD-tree),
 // compute the 3×3 covariance of those neighbors, decompose into eigenvalues
-// λ1 ≥ λ2 ≥ λ3, and classify:
+// λ1 ≤ λ2 ≤ λ3, and classify:
 //
-//   EDGE  : λ1 / (λ2 + ε) > edge_thresh          → one dominant direction
-//   PLANE : λ2 / (λ3 + ε) > plane_thresh
-//           AND λ1 / (λ2 + ε) < plane_upper_thresh → two dominant directions
+//   EDGE  : λ2 / (λ3 + ε) < edge_thresh            → one dominant direction
+//   PLANE : λ1 / (λ2 + ε) < plane_thresh
+//           AND λ2 / (λ3 + ε) > plane_upper_thresh → two dominant directions
 //   UNSTRUCTURED : everything else
 //
 // This module is diagnostics-only and does not affect the estimator.
@@ -28,9 +28,9 @@ void StructuralDiagnostics::init(ros::NodeHandle& nh)
     nh.param<bool>  ("struct_diag/enable",              cfg_.enable,              true);
     nh.param<int>   ("struct_diag/k_neighbors",         cfg_.k_neighbors,         10);
     nh.param<double>("struct_diag/min_range",            cfg_.min_range,            0.5);
-    nh.param<double>("struct_diag/edge_thresh",          cfg_.edge_thresh,          10.0);
-    nh.param<double>("struct_diag/plane_thresh",         cfg_.plane_thresh,         10.0);
-    nh.param<double>("struct_diag/plane_upper_thresh",   cfg_.plane_upper_thresh,   3.0);
+    nh.param<double>("struct_diag/edge_thresh",          cfg_.edge_thresh,          0.1);
+    nh.param<double>("struct_diag/plane_thresh",         cfg_.plane_thresh,         0.1);
+    nh.param<double>("struct_diag/plane_upper_thresh",   cfg_.plane_upper_thresh,   0.333333);
     nh.param<double>("struct_diag/eps",                  cfg_.eps,                  1e-6);
 
     // Advertise diagnostic point-cloud topics
@@ -38,7 +38,7 @@ void StructuralDiagnostics::init(ros::NodeHandle& nh)
     pub_plane_ = nh.advertise<sensor_msgs::PointCloud2>("/struct_diag/plane_cloud", 10);
 
     ROS_INFO("[StructDiag] Initialised — k=%d  min_range=%.2f  "
-             "edge_thresh=%.1f  plane_thresh=%.1f  plane_upper=%.1f  enable=%d",
+             "edge_thresh=%.3f  plane_thresh=%.3f  plane_upper=%.3f  enable=%d",
              cfg_.k_neighbors, cfg_.min_range,
              cfg_.edge_thresh, cfg_.plane_thresh, cfg_.plane_upper_thresh,
              cfg_.enable);
@@ -81,21 +81,21 @@ Eigen::Matrix3d StructuralDiagnostics::computeNeighborhoodCovariance(
 
 // ============================================================================
 // classifyLocalStructure
-//   Eigenvalues must be passed in DESCENDING order: λ1 ≥ λ2 ≥ λ3.
+//   Eigenvalues must be passed in ASCENDING order: λ1 ≤ λ2 ≤ λ3.
 //   Returns: 1 = edge, 2 = plane, 0 = unstructured.
 // ============================================================================
 int StructuralDiagnostics::classifyLocalStructure(
     double lambda1, double lambda2, double lambda3) const
 {
-    const double ratio12 = lambda1 / (lambda2 + cfg_.eps);
     const double ratio23 = lambda2 / (lambda3 + cfg_.eps);
+    const double ratio12 = lambda1 / (lambda2 + cfg_.eps);
 
-    // Edge-like: one dominant eigenvalue → strong λ1, much larger than λ2
-    if (ratio12 > cfg_.edge_thresh)
+    // Edge-like: one dominant eigenvalue → λ2 much smaller than λ3
+    if (ratio23 < cfg_.edge_thresh)
         return 1;
 
-    // Plane-like: two dominant eigenvalues → λ2 >> λ3, but λ1 ≈ λ2
-    if (ratio23 > cfg_.plane_thresh && ratio12 < cfg_.plane_upper_thresh)
+    // Plane-like: two dominant eigenvalues → λ1 much smaller than λ2, and λ2 close to λ3
+    if (ratio12 < cfg_.plane_thresh && ratio23 > cfg_.plane_upper_thresh)
         return 2;
 
     return 0;  // unstructured
@@ -164,11 +164,11 @@ StructuralDiagResult StructuralDiagnostics::analyze(
 
         // Eigenvalue decomposition (self-adjoint → real eigenvalues)
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(cov);
-        // Eigen returns eigenvalues in ASCENDING order → reverse
+        // Eigen returns eigenvalues in ASCENDING order.
         Eigen::Vector3d ev = solver.eigenvalues();
-        double lambda1 = ev(2);   // largest
+        double lambda1 = ev(0);   // smallest
         double lambda2 = ev(1);
-        double lambda3 = ev(0);   // smallest
+        double lambda3 = ev(2);   // largest
 
         int label = classifyLocalStructure(lambda1, lambda2, lambda3);
 

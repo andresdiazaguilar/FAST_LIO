@@ -53,12 +53,13 @@ struct StructuralDiagConfig
     double min_range               = 0.5;
 
     // Classification thresholds (see classifyLocalStructure)
-    //   edge  if   lambda1 / (lambda2 + eps)  >  edge_thresh
-    //   plane if   lambda2 / (lambda3 + eps)  >  plane_thresh
-    //          AND lambda1 / (lambda2 + eps)  <  plane_upper_thresh
-    double edge_thresh             = 10.0;
-    double plane_thresh            = 10.0;
-    double plane_upper_thresh      = 3.0;
+    // Eigenvalues are ordered ASCENDING: lambda1 <= lambda2 <= lambda3.
+    //   edge  if   lambda2 / (lambda3 + eps)  <  edge_thresh
+    //   plane if   lambda1 / (lambda2 + eps)  <  plane_thresh
+    //          AND lambda2 / (lambda3 + eps)  >  plane_upper_thresh
+    double edge_thresh             = 0.1;        // 1 / 10.0
+    double plane_thresh            = 0.1;        // 1 / 10.0
+    double plane_upper_thresh      = 0.333333;   // 1 / 3.0
 
     // Numerical epsilon to avoid division by zero
     double eps                     = 1e-6;
@@ -92,7 +93,7 @@ private:
         const PointCloudXYZI& cloud,
         const std::vector<int>& indices) const;
 
-    /// Classify a point given the sorted eigenvalues (descending).
+    /// Classify a point given the sorted eigenvalues (ascending).
     /// Returns 0=unstructured, 1=edge, 2=plane.
     int classifyLocalStructure(double lambda1,
                                double lambda2,
