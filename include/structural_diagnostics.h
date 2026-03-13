@@ -15,6 +15,7 @@
 #include <pcl/point_types.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <std_msgs/Float64MultiArray.h>
 #include <ros/ros.h>
 #include <Eigen/Dense>
 
@@ -107,4 +108,6 @@ private:
 
     ros::Publisher pub_edge_;
     ros::Publisher pub_plane_;
+    ros::Publisher pub_edge_count_;
+    ros::Publisher pub_plane_count_;
 };

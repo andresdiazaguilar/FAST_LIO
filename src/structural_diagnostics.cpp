@@ -36,6 +36,9 @@ void StructuralDiagnostics::init(ros::NodeHandle& nh)
     // Advertise diagnostic point-cloud topics
     pub_edge_  = nh.advertise<sensor_msgs::PointCloud2>("/struct_diag/edge_cloud",  10);
     pub_plane_ = nh.advertise<sensor_msgs::PointCloud2>("/struct_diag/plane_cloud", 10);
+    // Scalar counts for external plotting: [timestamp, count]
+    pub_edge_count_  = nh.advertise<std_msgs::Float64MultiArray>("/struct_diag/edge_count", 10);
+    pub_plane_count_ = nh.advertise<std_msgs::Float64MultiArray>("/struct_diag/plane_count", 10);
 
     ROS_INFO("[StructDiag] Initialised — k=%d  min_range=%.2f  "
              "edge_thresh=%.3f  plane_thresh=%.3f  plane_upper=%.3f  enable=%d",
@@ -220,6 +223,18 @@ void StructuralDiagnostics::publishAndLog(
              res.edge_count,  res.edge_ratio  * 100.0,
              res.plane_count, res.plane_ratio * 100.0,
              res.unstructured_count);
+
+    std_msgs::Float64MultiArray edge_count_msg;
+    edge_count_msg.data.resize(2);
+    edge_count_msg.data[0] = header.stamp.toSec();
+    edge_count_msg.data[1] = static_cast<double>(res.edge_count);
+    pub_edge_count_.publish(edge_count_msg);
+
+    std_msgs::Float64MultiArray plane_count_msg;
+    plane_count_msg.data.resize(2);
+    plane_count_msg.data[0] = header.stamp.toSec();
+    plane_count_msg.data[1] = static_cast<double>(res.plane_count);
+    pub_plane_count_.publish(plane_count_msg);
 
     // Publish edge cloud
     if (!res.edge_cloud->empty())

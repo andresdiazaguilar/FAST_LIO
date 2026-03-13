@@ -78,6 +78,9 @@ ros::Publisher pubEigvalsPostTranslation;
 ros::Publisher pubEigvalsPostRotation;
 ros::Publisher pubPreTranslationWeakestDirMarker;
 ros::Publisher pubPreRotationWeakestDirMarker;
+ros::Publisher pubAccelCompWorldMarker;
+ros::Publisher pubGravityEstimateMarker;
+ros::Publisher pubAccelGravityComponents;
 ros::Publisher pubInlierRatio;
 ros::Publisher pubResidualStats;
 ros::Publisher pubGyroBias;
@@ -774,6 +777,44 @@ void publish_arrow_marker(const ros::Publisher &pub,
     pub.publish(marker);
 }
 
+void publish_arrow_marker_vec(const ros::Publisher &pub,
+                              const std::string &ns,
+                              const V3D &origin,
+                              const Eigen::Matrix<double, 3, 1> &vec,
+                              const double r,
+                              const double g,
+                              const double b,
+                              const double stamp_sec)
+{
+    visualization_msgs::Marker marker;
+    marker.header.frame_id = "camera_init";
+    marker.header.stamp = ros::Time().fromSec(stamp_sec);
+    marker.ns = ns;
+    marker.id = 0;
+    marker.type = visualization_msgs::Marker::ARROW;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.orientation.w = 1.0; // identity quaternion
+
+    geometry_msgs::Point p0, p1;
+    p0.x = origin(0); p0.y = origin(1); p0.z = origin(2);
+    p1.x = origin(0) + vec(0);
+    p1.y = origin(1) + vec(1);
+    p1.z = origin(2) + vec(2);
+    marker.points.push_back(p0);
+    marker.points.push_back(p1);
+
+    marker.scale.x = 0.14;  // shaft diameter
+    marker.scale.y = 0.24;  // head diameter
+    marker.scale.z = 0.30;  // head length
+    marker.color.r = r;
+    marker.color.g = g;
+    marker.color.b = b;
+    marker.color.a = 1.0;
+    marker.lifetime = ros::Duration(0.0);
+
+    pub.publish(marker);
+}
+
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
@@ -851,7 +892,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         static_cast<double>(effct_feat_num) / static_cast<double>(feats_down_size) : 0.0;
     std_msgs::Float64MultiArray inlier_msg;
     inlier_msg.data.resize(2);
-    inlier_msg.data[0] = Measures.lidar_beg_time;
+    inlier_msg.data[0] = lidar_end_time;
     inlier_msg.data[1] = inlier_ratio;
     pubInlierRatio.publish(inlier_msg);
 
@@ -866,7 +907,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
     std_msgs::Float64MultiArray residual_msg;
     residual_msg.data.resize(4);
-    residual_msg.data[0] = Measures.lidar_beg_time;
+    residual_msg.data[0] = lidar_end_time;
     residual_msg.data[1] = residual_median;
     residual_msg.data[2] = residual_p95;
     residual_msg.data[3] = residuals_effective.empty() ? std::numeric_limits<double>::quiet_NaN() :
@@ -996,7 +1037,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 std::lock_guard<std::mutex> lk(g_info_mtx);
                 g_Apose = Apose;
                 g_ratio_rt = ratio_rt;
-                g_last_lidar_time_for_info = Measures.lidar_beg_time;
+                g_last_lidar_time_for_info = lidar_end_time;
                 g_last_effct_feat_num = effct_feat_num;
                 g_have_Apose = true;
             }
@@ -1005,8 +1046,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             {
                 const Eigen::Matrix<double, 3, 3> Atrans_pre = Apose.block<3,3>(0,0);
                 const Eigen::Matrix<double, 3, 3> Arot_pre   = Apose.block<3,3>(3,3);
-                publish_3x3_info_spectrum(Atrans_pre, Measures.lidar_beg_time, effct_feat_num, pubEigvalsPreTranslation);
-                publish_3x3_info_spectrum(Arot_pre,   Measures.lidar_beg_time, effct_feat_num, pubEigvalsPreRotation);
+                publish_3x3_info_spectrum(Atrans_pre, lidar_end_time, effct_feat_num, pubEigvalsPreTranslation);
+                publish_3x3_info_spectrum(Arot_pre,   lidar_end_time, effct_feat_num, pubEigvalsPreRotation);
 
                 Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 3, 3>> es_t(Atrans_pre);
                 Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 3, 3>> es_r(Arot_pre);
@@ -1029,7 +1070,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                         }
                         g_pre_weakest_trans_dir = weakest_t;
                         g_pre_weakest_rot_dir = weakest_r;
-                        g_pre_weakest_lidar_time = Measures.lidar_beg_time;
+                        g_pre_weakest_lidar_time = lidar_end_time;
                         g_have_pre_weakest_dirs = true;
                     }
                 }
@@ -1054,7 +1095,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 // Publish (pose-only)
                 std_msgs::Float64MultiArray msg;
                 msg.data.resize(12);
-                msg.data[0] = Measures.lidar_beg_time;
+                msg.data[0] = lidar_end_time;
                 msg.data[1] = static_cast<double>(effct_feat_num);
                 msg.data[2] = lambda_min;
                 msg.data[3] = lambda_max;
@@ -1085,6 +1126,9 @@ int main(int argc, char** argv)
     pubEigvalsPostRotation = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/eigvals_post_rotation", 1000);
     pubPreTranslationWeakestDirMarker = nh.advertise<visualization_msgs::Marker>("/fastlio/pre_translation_weakest_dir_marker", 1000);
     pubPreRotationWeakestDirMarker = nh.advertise<visualization_msgs::Marker>("/fastlio/pre_rotation_weakest_dir_marker", 1000);
+    pubAccelCompWorldMarker = nh.advertise<visualization_msgs::Marker>("/fastlio/accel_compensated_world_marker", 1000);
+    pubGravityEstimateMarker = nh.advertise<visualization_msgs::Marker>("/fastlio/gravity_estimate_marker", 1000);
+    pubAccelGravityComponents = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/accel_gravity_components", 1000);
     pubInlierRatio = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/inlier_ratio", 1000);
     pubResidualStats = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/residual_stats", 1000);
     pubGyroBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gyro_bias", 1000);
@@ -1332,7 +1376,7 @@ int main(int argc, char** argv)
             t2 = omp_get_wtime();
 
             /*** Structural feature diagnostics (edge / plane counts) ***/
-            struct_diag.analyze(feats_down_body, Measures.lidar_beg_time);
+            struct_diag.analyze(feats_down_body, lidar_end_time);
 
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
@@ -1413,7 +1457,7 @@ int main(int argc, char** argv)
             {
                 std::lock_guard<std::mutex> lk(g_info_mtx);
                 if (g_have_pre_weakest_dirs &&
-                    std::fabs(g_pre_weakest_lidar_time - Measures.lidar_beg_time) < 1e-6)
+                    std::fabs(g_pre_weakest_lidar_time - lidar_end_time) < 1e-6)
                 {
                     weakest_t_dir = g_pre_weakest_trans_dir;
                     weakest_r_dir = g_pre_weakest_rot_dir;
@@ -1438,6 +1482,67 @@ int main(int argc, char** argv)
                                      1.5,
                                      0.0, 0.0, 1.0,
                                      lidar_end_time);
+            }
+
+            // ---- World-frame vectors for RViz arrows ----
+            // 1) Bias-compensated accelerometer mean in world frame.
+            Eigen::Matrix<double, 3, 1> a_world = Eigen::Matrix<double, 3, 1>::Zero();
+            bool have_a_world = false;
+            if (!Measures.imu.empty())
+            {
+                Eigen::Matrix<double, 3, 1> a_m_mean = Eigen::Matrix<double, 3, 1>::Zero();
+                for (const auto &imu_msg : Measures.imu)
+                {
+                    a_m_mean(0) += imu_msg->linear_acceleration.x;
+                    a_m_mean(1) += imu_msg->linear_acceleration.y;
+                    a_m_mean(2) += imu_msg->linear_acceleration.z;
+                }
+                a_m_mean /= static_cast<double>(Measures.imu.size());
+
+                const Eigen::Matrix<double, 3, 1> a_body = (a_m_mean*G_m_s2) - state_point.ba;
+                a_world = state_point.rot * a_body;
+                have_a_world = true;
+                if (a_world.norm() > 1e-12)
+                {
+                    const Eigen::Matrix<double, 3, 1> a_world_disp = 0.2 * a_world;
+                    publish_arrow_marker_vec(pubAccelCompWorldMarker,
+                                             "accel_compensated_world",
+                                             pos_lid,
+                                             a_world_disp,
+                                             0.0, 1.0, 0.0,
+                                             lidar_end_time);
+                }
+            }
+
+            // 2) Estimated gravity vector from filter state.
+            Eigen::Matrix<double, 3, 1> g_est;
+            g_est(0) = state_point.grav[0];
+            g_est(1) = state_point.grav[1];
+            g_est(2) = state_point.grav[2];
+            if (g_est.norm() > 1e-12)
+            {
+                const Eigen::Matrix<double, 3, 1> g_est_disp = 0.2 * g_est;
+                publish_arrow_marker_vec(pubGravityEstimateMarker,
+                                         "gravity_estimate",
+                                         pos_lid,
+                                         g_est_disp,
+                                         1.0, 1.0, 0.0,
+                                         lidar_end_time);
+            }
+
+            if (have_a_world && g_est.norm() > 1e-12)
+            {
+                const Eigen::Matrix<double, 3, 1> g_hat = g_est / g_est.norm();
+                const double a_parallel = a_world.dot(g_hat);
+                const double a_orth_sq = std::max(0.0, a_world.squaredNorm() - a_parallel * a_parallel);
+                const double a_orth = std::sqrt(a_orth_sq);
+
+                std_msgs::Float64MultiArray comp_msg;
+                comp_msg.data.resize(3);
+                comp_msg.data[0] = lidar_end_time;
+                comp_msg.data[1] = a_parallel;
+                comp_msg.data[2] = a_orth;
+                pubAccelGravityComponents.publish(comp_msg);
             }
 
             std_msgs::Float64MultiArray gyro_bias_msg;
