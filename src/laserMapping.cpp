@@ -72,6 +72,12 @@
 #define PUBFRAME_PERIOD     (20)
 
 ros::Publisher pubDeg;
+ros::Publisher pubEigvalsPreTranslation;
+ros::Publisher pubEigvalsPreRotation;
+ros::Publisher pubEigvalsPostTranslation;
+ros::Publisher pubEigvalsPostRotation;
+ros::Publisher pubPreTranslationWeakestDirMarker;
+ros::Publisher pubPreRotationWeakestDirMarker;
 ros::Publisher pubInlierRatio;
 ros::Publisher pubResidualStats;
 ros::Publisher pubGyroBias;
@@ -88,6 +94,10 @@ double g_ratio_rt = 0.0;
 double g_last_lidar_time_for_info = 0.0;
 int g_last_effct_feat_num = 0;
 bool g_have_Apose = false;
+Eigen::Matrix<double, 3, 1> g_pre_weakest_trans_dir = Eigen::Matrix<double, 3, 1>::Zero();
+Eigen::Matrix<double, 3, 1> g_pre_weakest_rot_dir = Eigen::Matrix<double, 3, 1>::Zero();
+double g_pre_weakest_lidar_time = 0.0;
+bool g_have_pre_weakest_dirs = false;
 /*******************************/
 
 ros::Publisher pubDegPost;
@@ -684,6 +694,86 @@ double percentile_from_sorted(const std::vector<float> &vals_sorted, const doubl
     return w_lo * static_cast<double>(vals_sorted[lo]) + w_hi * static_cast<double>(vals_sorted[hi]);
 }
 
+bool publish_3x3_info_spectrum(const Eigen::Matrix<double, 3, 3> &A_block,
+                               const double t_meas,
+                               const int eff_feat_num,
+                               ros::Publisher &pub)
+{
+    // Check if A_block has any non-finite values (NaN or Inf)
+    if (!A_block.allFinite())
+    {
+        return false;
+    }
+
+    // Compute the eigenvalues of A_block
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 3, 3>> es(A_block);
+    if (es.info() != Eigen::Success)
+    {
+        return false;
+    }
+
+    // SelfAdjointEigenSolver returns eigenvalues in ascending order.
+    const Eigen::Matrix<double, 3, 1> eig = es.eigenvalues();
+    const double lambda1 = eig(0);
+    const double lambda2 = eig(1);
+    const double lambda3 = eig(2);
+    const double lambda_min = lambda1;
+    const double lambda_max = lambda3;
+    const double cond = lambda_max / std::max(lambda_min, 1e-12);
+
+    std_msgs::Float64MultiArray msg;
+    msg.data.resize(8);
+    msg.data[0] = t_meas;
+    msg.data[1] = static_cast<double>(eff_feat_num);
+    msg.data[2] = lambda1;
+    msg.data[3] = lambda2;
+    msg.data[4] = lambda3;
+    msg.data[5] = lambda_min;
+    msg.data[6] = lambda_max;
+    msg.data[7] = cond;
+    pub.publish(msg);
+    return true;
+}
+
+void publish_arrow_marker(const ros::Publisher &pub,
+                          const std::string &ns,
+                          const V3D &origin,
+                          const Eigen::Matrix<double, 3, 1> &dir_unit,
+                          const double arrow_len,
+                          const double r,
+                          const double g,
+                          const double b,
+                          const double stamp_sec)
+{
+    visualization_msgs::Marker marker;
+    marker.header.frame_id = "camera_init";
+    marker.header.stamp = ros::Time().fromSec(stamp_sec);
+    marker.ns = ns;
+    marker.id = 0;
+    marker.type = visualization_msgs::Marker::ARROW;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.orientation.w = 1.0; // identity quaternion
+
+    geometry_msgs::Point p0, p1;
+    p0.x = origin(0); p0.y = origin(1); p0.z = origin(2);
+    p1.x = origin(0) + arrow_len * dir_unit(0);
+    p1.y = origin(1) + arrow_len * dir_unit(1);
+    p1.z = origin(2) + arrow_len * dir_unit(2);
+    marker.points.push_back(p0);
+    marker.points.push_back(p1);
+
+    marker.scale.x = 0.14;  // shaft diameter
+    marker.scale.y = 0.24;  // head diameter
+    marker.scale.z = 0.30;  // head length
+    marker.color.r = r;
+    marker.color.g = g;
+    marker.color.b = b;
+    marker.color.a = 1.0;
+    marker.lifetime = ros::Duration(0.0);
+
+    pub.publish(marker);
+}
+
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
@@ -835,7 +925,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
         // Use only pose part: effct_feat_num x 6
         // (Assumes first 6 columns correspond to pose error-state in this implementation.)
-        if (Hfull.rows() >= 6)
+        if (Hfull.rows() >= 6 && Hfull.cols() >= 6)
         {
             Eigen::MatrixXd Hpose = Hfull.leftCols(6);  // size: effct_feat_num x 6
 
@@ -911,6 +1001,40 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 g_have_Apose = true;
             }
 
+            if (Apose.allFinite())
+            {
+                const Eigen::Matrix<double, 3, 3> Atrans_pre = Apose.block<3,3>(0,0);
+                const Eigen::Matrix<double, 3, 3> Arot_pre   = Apose.block<3,3>(3,3);
+                publish_3x3_info_spectrum(Atrans_pre, Measures.lidar_beg_time, effct_feat_num, pubEigvalsPreTranslation);
+                publish_3x3_info_spectrum(Arot_pre,   Measures.lidar_beg_time, effct_feat_num, pubEigvalsPreRotation);
+
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 3, 3>> es_t(Atrans_pre);
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 3, 3>> es_r(Arot_pre);
+                if (es_t.info() == Eigen::Success && es_r.info() == Eigen::Success)
+                {
+                    Eigen::Matrix<double, 3, 1> weakest_t = es_t.eigenvectors().col(0); // smallest eigval dir
+                    Eigen::Matrix<double, 3, 1> weakest_r = es_r.eigenvectors().col(0); // smallest eigval dir
+                    const double nt = weakest_t.norm();
+                    const double nr = weakest_r.norm();
+                    if (nt > 1e-12 && nr > 1e-12)
+                    {
+                        weakest_t /= nt;
+                        weakest_r /= nr;
+
+                        std::lock_guard<std::mutex> lk(g_info_mtx);
+                        if (g_have_pre_weakest_dirs)
+                        {
+                            if (weakest_t.dot(g_pre_weakest_trans_dir) < 0.0) weakest_t = -weakest_t;
+                            if (weakest_r.dot(g_pre_weakest_rot_dir) < 0.0) weakest_r = -weakest_r;
+                        }
+                        g_pre_weakest_trans_dir = weakest_t;
+                        g_pre_weakest_rot_dir = weakest_r;
+                        g_pre_weakest_lidar_time = Measures.lidar_beg_time;
+                        g_have_pre_weakest_dirs = true;
+                    }
+                }
+            }
+
             if (es.info() == Eigen::Success && es_scaled.info() == Eigen::Success)
             {
                 Eigen::Matrix<double, 6, 1> eig = es.eigenvalues();
@@ -955,6 +1079,12 @@ int main(int argc, char** argv)
 
     pubDeg = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/degeneracy", 1000);
     pubDegPost = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/degeneracy_post", 1000);   
+    pubEigvalsPreTranslation = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/eigvals_pre_translation", 1000);
+    pubEigvalsPreRotation = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/eigvals_pre_rotation", 1000);
+    pubEigvalsPostTranslation = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/eigvals_post_translation", 1000);
+    pubEigvalsPostRotation = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/eigvals_post_rotation", 1000);
+    pubPreTranslationWeakestDirMarker = nh.advertise<visualization_msgs::Marker>("/fastlio/pre_translation_weakest_dir_marker", 1000);
+    pubPreRotationWeakestDirMarker = nh.advertise<visualization_msgs::Marker>("/fastlio/pre_rotation_weakest_dir_marker", 1000);
     pubInlierRatio = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/inlier_ratio", 1000);
     pubResidualStats = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/residual_stats", 1000);
     pubGyroBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gyro_bias", 1000);
@@ -1233,27 +1363,39 @@ int main(int argc, char** argv)
                 // Pose covariance in the filter state, aligned with Hpose ordering: [pos(3), rot(3)].
                 Eigen::Matrix<double, 6, 6> P_pose = Pfull.block<6,6>(0,0);
 
-                // Posterior information (more stable than inverse()).
-                Eigen::Matrix<double, 6, 6> info_post_pose =
-                    P_pose.ldlt().solve(Eigen::Matrix<double,6,6>::Identity());
-
-                Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double,6,6>> es(info_post_pose);
-                if (es.info() == Eigen::Success)
+                Eigen::LDLT<Eigen::Matrix<double, 6, 6>> ldlt(P_pose);
+                if (ldlt.info() == Eigen::Success)
                 {
-                    auto eig = es.eigenvalues();
-                    double lam_min = eig.minCoeff();
-                    double lam_max = eig.maxCoeff();
-                    double cond_post = lam_max / std::max(lam_min, 1e-12);
+                    // Posterior information (more stable than inverse()).
+                    const Eigen::Matrix<double, 6, 6> info_post_pose =
+                        ldlt.solve(Eigen::Matrix<double,6,6>::Identity());
 
-                    std_msgs::Float64MultiArray msg;
-                    msg.data.resize(6);
-                    msg.data[0] = t_meas;
-                    msg.data[1] = static_cast<double>(eff_feat);
-                    msg.data[2] = lam_min;
-                    msg.data[3] = lam_max;
-                    msg.data[4] = cond_post;
-                    msg.data[5] = ratio_rt;
-                    pubDegPost.publish(msg);
+                    if (ldlt.info() == Eigen::Success && info_post_pose.allFinite())
+                    {
+                        const Eigen::Matrix<double, 3, 3> Atrans_post = info_post_pose.block<3,3>(0,0);
+                        const Eigen::Matrix<double, 3, 3> Arot_post   = info_post_pose.block<3,3>(3,3);
+                        publish_3x3_info_spectrum(Atrans_post, t_meas, eff_feat, pubEigvalsPostTranslation);
+                        publish_3x3_info_spectrum(Arot_post,   t_meas, eff_feat, pubEigvalsPostRotation);
+
+                        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double,6,6>> es(info_post_pose);
+                        if (es.info() == Eigen::Success)
+                        {
+                            auto eig = es.eigenvalues();
+                            double lam_min = eig.minCoeff();
+                            double lam_max = eig.maxCoeff();
+                            double cond_post = lam_max / std::max(lam_min, 1e-12);
+
+                            std_msgs::Float64MultiArray msg;
+                            msg.data.resize(6);
+                            msg.data[0] = t_meas;
+                            msg.data[1] = static_cast<double>(eff_feat);
+                            msg.data[2] = lam_min;
+                            msg.data[3] = lam_max;
+                            msg.data[4] = cond_post;
+                            msg.data[5] = ratio_rt;
+                            pubDegPost.publish(msg);
+                        }
+                    }
                 }
             }
 
@@ -1264,6 +1406,39 @@ int main(int argc, char** argv)
             geoQuat.y = state_point.rot.coeffs()[1];
             geoQuat.z = state_point.rot.coeffs()[2];
             geoQuat.w = state_point.rot.coeffs()[3];
+
+            Eigen::Matrix<double, 3, 1> weakest_t_dir = Eigen::Matrix<double, 3, 1>::Zero();
+            Eigen::Matrix<double, 3, 1> weakest_r_dir = Eigen::Matrix<double, 3, 1>::Zero();
+            bool have_pre_dirs_this_frame = false;
+            {
+                std::lock_guard<std::mutex> lk(g_info_mtx);
+                if (g_have_pre_weakest_dirs &&
+                    std::fabs(g_pre_weakest_lidar_time - Measures.lidar_beg_time) < 1e-6)
+                {
+                    weakest_t_dir = g_pre_weakest_trans_dir;
+                    weakest_r_dir = g_pre_weakest_rot_dir;
+                    have_pre_dirs_this_frame = true;
+                }
+            }
+            if (have_pre_dirs_this_frame &&
+                weakest_t_dir.norm() > 1e-12 &&
+                weakest_r_dir.norm() > 1e-12)
+            {
+                publish_arrow_marker(pubPreTranslationWeakestDirMarker,
+                                     "pre_translation_weakest_dir",
+                                     pos_lid,
+                                     weakest_t_dir,
+                                     2.0,
+                                     1.0, 0.0, 0.0,
+                                     lidar_end_time);
+                publish_arrow_marker(pubPreRotationWeakestDirMarker,
+                                     "pre_rotation_weakest_dir",
+                                     pos_lid,
+                                     weakest_r_dir,
+                                     1.5,
+                                     0.0, 0.0, 1.0,
+                                     lidar_end_time);
+            }
 
             std_msgs::Float64MultiArray gyro_bias_msg;
             gyro_bias_msg.data.resize(5);
