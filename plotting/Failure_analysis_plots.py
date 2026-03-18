@@ -16,8 +16,6 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
 # Drift_GTC dataset:
 bag_path = "/home/andres/semester_project/data/tinamu_failure_data/drift_gtc/drift_gtc_fail_full.bag"
 
-
-
 imu_topic = "/livox/imu"
 deg_topic = "/fastlio/degeneracy"
 post_deg_topic = "/fastlio/degeneracy_post"
@@ -83,6 +81,21 @@ gravity = {"accel_gravity_consistency", "gravity_estimate"}
 ENABLED_PLOTS =  {"cond_numbers_and_min_eigenvalues", "eigenvals", "imu", "feature_count", "gravity", "residual_stats"}
 # ENABLED_PLOTS = {"cond_numbers_and_min_eigenvalues", "eigenvals"}
 
+# -------------------------
+# Zoomed inset selection
+# -------------------------
+# Master toggle for all zoomed inset subplots.
+ENABLE_ZOOM_INSETS = False
+# Per-plot toggle for zoomed inset subplots.
+# These keys match the grouped plot keys used in ENABLED_PLOTS.
+ZOOM_INSETS = {
+    "cond_numbers_and_min_eigenvalues": True,
+    "eigenvals": True,
+    "imu": True,
+    "feature_count": True,
+    "gravity": True,
+    "residual_stats": True,
+}
 
 OMEGA_RUNNING_AVG_WINDOW = 200
 
@@ -99,9 +112,32 @@ SAVE_PLOTS_DPI = 300
 # If True, create a timestamped subfolder for each run.
 SAVE_PLOTS_TIMESTAMPED_SUBDIR = True
 
+# Focus window and failure marker (adjust as needed)
+xmin, xmax = 50, 150
+# Mode: "time" (single vertical line) or "period" (shaded time interval)
+
+FAILURE_MARKER_MODE = "period"
+
+# Used when FAILURE_MARKER_MODE == "time"
+t_marker = 37  # cameroon: 145, silo case 1: 21, silo case 2: 37, drift_gtc: 0-20
+
+# Used when FAILURE_MARKER_MODE == "period"
+# Define one or more failure periods as (start_time, end_time).
+FAILURE_PERIODS = [
+    (0, 20),
+    (42, 50),
+    (90, 95),
+]
+
+zoom_half_window = 10.0
+
 
 def should_plot(key):
     return ENABLED_PLOTS == "all" or key in ENABLED_PLOTS
+
+
+def should_show_zoom_inset(key):
+    return ENABLE_ZOOM_INSETS and ZOOM_INSETS.get(key, True)
 
 
 def _sanitize_filename(name):
@@ -553,13 +589,41 @@ def nearest_index(sorted_times, t):
     prev_i = idx - 1
     return prev_i if abs(sorted_times[prev_i] - t) <= abs(sorted_times[idx] - t) else idx
 
-# Focus window and failure time (adjust as needed)
-xmin, xmax = 50, 150
-t_marker = 37 # cameroon: 145
-zoom_half_window = 10.0
+def failure_center_time():
+    if FAILURE_MARKER_MODE == "period":
+        periods = get_failure_periods()
+        if periods:
+            # Use the period whose center is closest to t_marker as zoom anchor.
+            start, end = min(periods, key=lambda p: abs(0.5 * (p[0] + p[1]) - t_marker))
+            return 0.5 * (start + end)
+    return t_marker
 
-def add_marker_line():
-    plt.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+
+def get_failure_periods():
+    periods = []
+    for period in FAILURE_PERIODS:
+        if len(period) != 2:
+            continue
+        start, end = period
+        if end < start:
+            start, end = end, start
+        periods.append((start, end))
+    return periods
+
+
+def add_marker_line(ax=None, linewidth=2, include_label=True):
+    if ax is None:
+        ax = plt.gca()
+    if FAILURE_MARKER_MODE == "period":
+        periods = get_failure_periods()
+        if not periods:
+            return
+        for i, (start, end) in enumerate(periods):
+            label = "failure period" if include_label and i == 0 else None
+            ax.axvspan(start, end, color="r", alpha=0.2, label=label)
+    else:
+        label = "failure time" if include_label else None
+        ax.axvline(x=t_marker, color="r", linestyle="--", linewidth=linewidth, label=label)
 
 # =========================
 # PRE plots
@@ -605,42 +669,44 @@ if (should_plot("imu_acc_pre") or
     axp.plot(t_imu, wy_avg, label=r"$\omega_y$")
     axp.plot(t_imu, wz_avg, label=r"$\omega_z$")
     axp.plot(t_deg, omega_mean_avg, label=r"$\omega_{\mathrm{mean}}$")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title(f"Gyro Angular Velocity (running avg, window={OMEGA_RUNNING_AVG_WINDOW})")
     axp.set_ylabel("angular velocity [rad/s]")
     axp.grid(True)
     axp.legend()
-    x1 = t_marker - zoom_half_window
-    x2 = t_marker + zoom_half_window
-    axins = inset_axes(
-        axp,
-        width="40%",
-        height="40%",
-        loc="lower left",
-        bbox_to_anchor=(0.08, 0.08, 1, 1),
-        bbox_transform=axp.transAxes,
-    )
-    axins.plot(t_imu, wx_avg)
-    axins.plot(t_imu, wy_avg)
-    axins.plot(t_imu, wz_avg)
-    axins.plot(t_deg, omega_mean_avg)
-    axins.axvline(x=t_marker, color="r", linestyle="--", linewidth=1)
-    axins.set_xlim(x1, x2)
-    y_zoom = (
-        [v for t, v in zip(t_imu, wx_avg) if x1 <= t <= x2] +
-        [v for t, v in zip(t_imu, wy_avg) if x1 <= t <= x2] +
-        [v for t, v in zip(t_imu, wz_avg) if x1 <= t <= x2] +
-        [v for t, v in zip(t_deg, omega_mean_avg) if x1 <= t <= x2]
-    )
-    if y_zoom:
-        y_min = min(y_zoom)
-        y_max = max(y_zoom)
-        pad = 0.05 * max(1e-6, y_max - y_min)
-        axins.set_ylim(y_min - pad, y_max + pad)
-    axins.grid(True, alpha=0.3)
-    axins.tick_params(labelsize=7, pad=1)
-    axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
-    mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
+    if should_show_zoom_inset("imu"):
+        x_center = failure_center_time()
+        x1 = x_center - zoom_half_window
+        x2 = x_center + zoom_half_window
+        axins = inset_axes(
+            axp,
+            width="40%",
+            height="40%",
+            loc="lower left",
+            bbox_to_anchor=(0.08, 0.08, 1, 1),
+            bbox_transform=axp.transAxes,
+        )
+        axins.plot(t_imu, wx_avg)
+        axins.plot(t_imu, wy_avg)
+        axins.plot(t_imu, wz_avg)
+        axins.plot(t_deg, omega_mean_avg)
+        add_marker_line(axins, linewidth=1, include_label=False)
+        axins.set_xlim(x1, x2)
+        y_zoom = (
+            [v for t, v in zip(t_imu, wx_avg) if x1 <= t <= x2] +
+            [v for t, v in zip(t_imu, wy_avg) if x1 <= t <= x2] +
+            [v for t, v in zip(t_imu, wz_avg) if x1 <= t <= x2] +
+            [v for t, v in zip(t_deg, omega_mean_avg) if x1 <= t <= x2]
+        )
+        if y_zoom:
+            y_min = min(y_zoom)
+            y_max = max(y_zoom)
+            pad = 0.05 * max(1e-6, y_max - y_min)
+            axins.set_ylim(y_min - pad, y_max + pad)
+        axins.grid(True, alpha=0.3)
+        axins.tick_params(labelsize=7, pad=1)
+        axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
+        mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
 
     axp = axs[0, 1]
     axp.plot(t_imu, ax_avg, label=r"$a_x$")
@@ -648,49 +714,53 @@ if (should_plot("imu_acc_pre") or
     axp.plot(t_imu, az_avg, label=r"$a_z$")
     axp.plot(t_deg, acc_mean_avg, label=r"$a_{\mathrm{mean}}$")
     axp.plot(t_deg, acc_mean_no_grav_avg, label=r"$a_{\mathrm{mean,no\ grav}}$")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title(f"Linear Acceleration (running avg, window={OMEGA_RUNNING_AVG_WINDOW})")
     axp.set_ylabel("acceleration")
     axp.grid(True)
     axp.legend()
-    axins = inset_axes(
-        axp,
-        width="40%",
-        height="30%",
-        loc="lower left",
-        bbox_to_anchor=(0.08, 0.08, 1, 1),
-        bbox_transform=axp.transAxes,
-    )
-    axins.plot(t_imu, ax_avg)
-    axins.plot(t_imu, ay_avg)
-    axins.plot(t_imu, az_avg)
-    axins.plot(t_deg, acc_mean_avg)
-    axins.plot(t_deg, acc_mean_no_grav_avg)
-    axins.axvline(x=t_marker, color="r", linestyle="--", linewidth=1)
-    axins.set_xlim(x1, x2)
-    y_zoom = (
-        [v for t, v in zip(t_imu, ax_avg) if x1 <= t <= x2] +
-        [v for t, v in zip(t_imu, ay_avg) if x1 <= t <= x2] +
-        [v for t, v in zip(t_imu, az_avg) if x1 <= t <= x2] +
-        [v for t, v in zip(t_deg, acc_mean_avg) if x1 <= t <= x2] +
-        [v for t, v in zip(t_deg, acc_mean_no_grav_avg) if x1 <= t <= x2]
-    )
-    if y_zoom:
-        y_min = min(y_zoom)
-        y_max = max(y_zoom)
-        pad = 0.05 * max(1e-6, y_max - y_min)
-        axins.set_ylim(y_min - pad, y_max + pad)
-    axins.grid(True, alpha=0.3)
-    axins.tick_params(labelsize=7, pad=1)
-    axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
-    mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
+    if should_show_zoom_inset("imu"):
+        x_center = failure_center_time()
+        x1 = x_center - zoom_half_window
+        x2 = x_center + zoom_half_window
+        axins = inset_axes(
+            axp,
+            width="40%",
+            height="30%",
+            loc="lower left",
+            bbox_to_anchor=(0.08, 0.08, 1, 1),
+            bbox_transform=axp.transAxes,
+        )
+        axins.plot(t_imu, ax_avg)
+        axins.plot(t_imu, ay_avg)
+        axins.plot(t_imu, az_avg)
+        axins.plot(t_deg, acc_mean_avg)
+        axins.plot(t_deg, acc_mean_no_grav_avg)
+        add_marker_line(axins, linewidth=1, include_label=False)
+        axins.set_xlim(x1, x2)
+        y_zoom = (
+            [v for t, v in zip(t_imu, ax_avg) if x1 <= t <= x2] +
+            [v for t, v in zip(t_imu, ay_avg) if x1 <= t <= x2] +
+            [v for t, v in zip(t_imu, az_avg) if x1 <= t <= x2] +
+            [v for t, v in zip(t_deg, acc_mean_avg) if x1 <= t <= x2] +
+            [v for t, v in zip(t_deg, acc_mean_no_grav_avg) if x1 <= t <= x2]
+        )
+        if y_zoom:
+            y_min = min(y_zoom)
+            y_max = max(y_zoom)
+            pad = 0.05 * max(1e-6, y_max - y_min)
+            axins.set_ylim(y_min - pad, y_max + pad)
+        axins.grid(True, alpha=0.3)
+        axins.tick_params(labelsize=7, pad=1)
+        axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
+        mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
 
     axp = axs[1, 0]
     axp.plot(t_gyro_bias, gyro_bx, label=r"$b_{g_x}$ [rad/s]")
     axp.plot(t_gyro_bias, gyro_by, label=r"$b_{g_y}$ [rad/s]")
     axp.plot(t_gyro_bias, gyro_bz, label=r"$b_{g_z}$ [rad/s]")
     axp.plot(t_gyro_bias, gyro_bnorm, label=r"$\|b_g\|$ [rad/s]")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Gyro Biases")
     axp.set_xlabel("time [s]")
     axp.set_ylabel("bias [rad/s]")
@@ -702,7 +772,7 @@ if (should_plot("imu_acc_pre") or
     axp.plot(t_accel_bias, accel_by, label=r"$b_{a_y}$ [g]")
     axp.plot(t_accel_bias, accel_bz, label=r"$b_{a_z}$ [g]")
     axp.plot(t_accel_bias, accel_bnorm, label=r"$\|b_a\|$ [g]")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Accel Biases")
     axp.set_xlabel("time [s]")
     axp.set_ylabel("bias [g]")
@@ -760,7 +830,7 @@ if (should_plot("feat_pre_post") or
     axp = axs[0, 0]
     axp.plot(t_deg, effective_feature_number, label="# effective features")
     # axp.plot(t_post, post_eff, label="effective feature number (post)")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Effective Feature Number")
     axp.set_ylabel("count")
     axp.grid(True)
@@ -768,7 +838,7 @@ if (should_plot("feat_pre_post") or
 
     axp = axs[0, 1]
     axp.plot(t_inlier_ratio, inlier_ratio, label="inlier ratio")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Inlier Ratio")
     axp.set_ylabel("ratio")
     axp.grid(True)
@@ -776,7 +846,7 @@ if (should_plot("feat_pre_post") or
 
     axp = axs[1, 0]
     axp.plot(t_plane_count, plane_count, label="# planar features")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Plane Feature Count")
     axp.set_xlabel("time [s]")
     axp.set_ylabel("count")
@@ -785,7 +855,7 @@ if (should_plot("feat_pre_post") or
 
     axp = axs[1, 1]
     axp.plot(t_edge_count, edge_count, label="# edge features")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Edge Feature Count")
     axp.set_xlabel("time [s]")
     axp.set_ylabel("count")
@@ -954,7 +1024,7 @@ if should_plot("gravity_estimate") or should_plot("accel_gravity_consistency") o
     axp.plot(t_gravity, gravity_y, label=r"$g_y$ [m/s$^2$]")
     axp.plot(t_gravity, gravity_z, label=r"$g_z$ [m/s$^2$]")
     axp.plot(t_gravity, gravity_norm, label=r"$\|g\|$ [m/s$^2$]")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Gravity Estimate")
     axp.set_ylabel(r"gravity [m/s$^2$]")
     axp.grid(True)
@@ -965,41 +1035,43 @@ if should_plot("gravity_estimate") or should_plot("accel_gravity_consistency") o
     axp.plot(t_accel_gravity_comp, neg_a_parallel, label=r"$-a_{\parallel}$ [m/s$^2$]")
     axp.plot(t_accel_gravity_comp, gravity_norm, label=r"$\|g\|$ [m/s$^2$]")
     # axp.plot(t_accel_consistency, abs_neg_a_parallel_minus_g, label="|-|a_parallel| - |g|| [m/s²]")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Linear Acceleration Components")
     axp.set_xlabel("time [s]")
     axp.set_ylabel(r"acceleration [m/s$^2$]")
     axp.grid(True)
     axp.legend()
-    x1 = t_marker - zoom_half_window
-    x2 = t_marker + zoom_half_window
-    axins = inset_axes(
-        axp,
-        width="25%",
-        height="50%",
-        loc="lower left",
-        bbox_to_anchor=(0.25, 0.08, 1, 1),
-        bbox_transform=axp.transAxes,
-    )
-    axins.plot(t_accel_gravity_comp, a_orth)
-    axins.plot(t_accel_gravity_comp, neg_a_parallel)
-    axins.plot(t_accel_gravity_comp, gravity_norm)
-    axins.axvline(x=t_marker, color="r", linestyle="--", linewidth=1)
-    axins.set_xlim(x1, x2)
-    y_zoom = (
-        [v for t, v in zip(t_accel_gravity_comp, a_orth) if x1 <= t <= x2] +
-        [v for t, v in zip(t_accel_gravity_comp, neg_a_parallel) if x1 <= t <= x2] +
-        [v for t, v in zip(t_accel_gravity_comp, gravity_norm) if x1 <= t <= x2]
-    )
-    if y_zoom:
-        y_min = min(y_zoom)
-        y_max = max(y_zoom)
-        pad = 0.05 * max(1e-6, y_max - y_min)
-        axins.set_ylim(y_min - pad, y_max + pad)
-    axins.grid(True, alpha=0.3)
-    axins.tick_params(labelsize=7, pad=1)
-    axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
-    mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
+    if should_show_zoom_inset("gravity"):
+        x_center = failure_center_time()
+        x1 = x_center - zoom_half_window
+        x2 = x_center + zoom_half_window
+        axins = inset_axes(
+            axp,
+            width="25%",
+            height="50%",
+            loc="lower left",
+            bbox_to_anchor=(0.25, 0.08, 1, 1),
+            bbox_transform=axp.transAxes,
+        )
+        axins.plot(t_accel_gravity_comp, a_orth)
+        axins.plot(t_accel_gravity_comp, neg_a_parallel)
+        axins.plot(t_accel_gravity_comp, gravity_norm)
+        add_marker_line(axins, linewidth=1, include_label=False)
+        axins.set_xlim(x1, x2)
+        y_zoom = (
+            [v for t, v in zip(t_accel_gravity_comp, a_orth) if x1 <= t <= x2] +
+            [v for t, v in zip(t_accel_gravity_comp, neg_a_parallel) if x1 <= t <= x2] +
+            [v for t, v in zip(t_accel_gravity_comp, gravity_norm) if x1 <= t <= x2]
+        )
+        if y_zoom:
+            y_min = min(y_zoom)
+            y_max = max(y_zoom)
+            pad = 0.05 * max(1e-6, y_max - y_min)
+            axins.set_ylim(y_min - pad, y_max + pad)
+        axins.grid(True, alpha=0.3)
+        axins.tick_params(labelsize=7, pad=1)
+        axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
+        mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
 
     fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
@@ -1017,7 +1089,7 @@ if (should_plot("eigvals_pre_translation") or
     ax.plot(t_eig_pre_trans, eig_pre_trans_1, label=r"$\lambda_1$")
     ax.plot(t_eig_pre_trans, eig_pre_trans_2, label=r"$\lambda_2$")
     ax.plot(t_eig_pre_trans, eig_pre_trans_3, label=r"$\lambda_3$")
-    ax.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(ax)
     ax.set_title("Pre Translation")
     ax.set_ylabel("eigenvalue")
     ax.grid(True)
@@ -1027,7 +1099,7 @@ if (should_plot("eigvals_pre_translation") or
     ax.plot(t_eig_pre_rot, eig_pre_rot_1, label=r"$\lambda_1$")
     ax.plot(t_eig_pre_rot, eig_pre_rot_2, label=r"$\lambda_2$")
     ax.plot(t_eig_pre_rot, eig_pre_rot_3, label=r"$\lambda_3$")
-    ax.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(ax)
     ax.set_title("Pre Rotation")
     ax.grid(True)
     ax.legend()
@@ -1036,7 +1108,7 @@ if (should_plot("eigvals_pre_translation") or
     ax.plot(t_eig_post_trans, eig_post_trans_1, label=r"$\lambda_1$")
     ax.plot(t_eig_post_trans, eig_post_trans_2, label=r"$\lambda_2$")
     ax.plot(t_eig_post_trans, eig_post_trans_3, label=r"$\lambda_3$")
-    ax.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(ax)
     ax.set_title("Post Translation")
     ax.set_xlabel("time [s]")
     ax.set_ylabel("eigenvalue")
@@ -1047,7 +1119,7 @@ if (should_plot("eigvals_pre_translation") or
     ax.plot(t_eig_post_rot, eig_post_rot_1, label=r"$\lambda_1$")
     ax.plot(t_eig_post_rot, eig_post_rot_2, label=r"$\lambda_2$")
     ax.plot(t_eig_post_rot, eig_post_rot_3, label=r"$\lambda_3$")
-    ax.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(ax)
     ax.set_title("Post Rotation")
     ax.set_xlabel("time [s]")
     ax.grid(True)
@@ -1075,144 +1147,158 @@ if (should_plot("cond_eigvals_translation") or
     axp = axs[0, 0]
     axp.plot(t_eig_pre_trans, cond_eig_pre_trans, label=r"$\kappa$ (pre translation)")
     axp.plot(t_eig_post_trans, cond_eig_post_trans, label=r"$\kappa$ (post translation)")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Condition Number - Translation")
     axp.set_ylabel("condition number")
     axp.grid(True)
     axp.legend()
     axp.set_ylim(0, 80)
-    x1 = t_marker - zoom_half_window
-    x2 = t_marker + zoom_half_window
-    axins = inset_axes(
-        axp,
-        width="40%",
-        height="40%",
-        loc="upper left",
-        bbox_to_anchor=(0.04, -0.2, 1, 1),
-        bbox_transform=axp.transAxes,
-    )
-    axins.plot(t_eig_pre_trans, cond_eig_pre_trans)
-    axins.plot(t_eig_post_trans, cond_eig_post_trans)
-    axins.axvline(x=t_marker, color="r", linestyle="--", linewidth=1)
-    axins.set_xlim(x1, x2)
-    y_zoom = (
-        [v for t, v in zip(t_eig_pre_trans, cond_eig_pre_trans) if x1 <= t <= x2] +
-        [v for t, v in zip(t_eig_post_trans, cond_eig_post_trans) if x1 <= t <= x2]
-    )
-    if y_zoom:
-        y_min = min(y_zoom)
-        y_max = max(y_zoom)
-        pad = 0.05 * max(1e-6, y_max - y_min)
-        axins.set_ylim(y_min - pad, y_max + pad)
-    axins.grid(True, alpha=0.3)
-    axins.tick_params(labelsize=7, pad=1)
-    axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
-    mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
+    if should_show_zoom_inset("cond_numbers_and_min_eigenvalues"):
+        x_center = failure_center_time()
+        x1 = x_center - zoom_half_window
+        x2 = x_center + zoom_half_window
+        axins = inset_axes(
+            axp,
+            width="40%",
+            height="40%",
+            loc="upper left",
+            bbox_to_anchor=(0.04, -0.2, 1, 1),
+            bbox_transform=axp.transAxes,
+        )
+        axins.plot(t_eig_pre_trans, cond_eig_pre_trans)
+        axins.plot(t_eig_post_trans, cond_eig_post_trans)
+        add_marker_line(axins, linewidth=1, include_label=False)
+        axins.set_xlim(x1, x2)
+        y_zoom = (
+            [v for t, v in zip(t_eig_pre_trans, cond_eig_pre_trans) if x1 <= t <= x2] +
+            [v for t, v in zip(t_eig_post_trans, cond_eig_post_trans) if x1 <= t <= x2]
+        )
+        if y_zoom:
+            y_min = min(y_zoom)
+            y_max = max(y_zoom)
+            pad = 0.05 * max(1e-6, y_max - y_min)
+            axins.set_ylim(y_min - pad, y_max + pad)
+        axins.grid(True, alpha=0.3)
+        axins.tick_params(labelsize=7, pad=1)
+        axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
+        mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
 
     axp = axs[0, 1]
     axp.plot(t_eig_pre_rot, cond_eig_pre_rot, label=r"$\kappa$ (pre rotation)")
     axp.plot(t_eig_post_rot, cond_eig_post_rot, label=r"$\kappa$ (post rotation)")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Condition Number - Rotation")
     axp.set_ylabel("condition number")
     axp.grid(True)
     axp.legend()
     axp.set_ylim(0, 120) # Cameroon: (0, 80) 
-    axins = inset_axes(
-        axp,
-        width="40%",
-        height="40%",
-        loc="upper left",
-        bbox_to_anchor=(0.04, -0.2, 1, 1),
-        bbox_transform=axp.transAxes,
-    )
-    axins.plot(t_eig_pre_rot, cond_eig_pre_rot)
-    axins.plot(t_eig_post_rot, cond_eig_post_rot)
-    axins.axvline(x=t_marker, color="r", linestyle="--", linewidth=1)
-    axins.set_xlim(x1, x2)
-    y_zoom = (
-        [v for t, v in zip(t_eig_pre_rot, cond_eig_pre_rot) if x1 <= t <= x2] +
-        [v for t, v in zip(t_eig_post_rot, cond_eig_post_rot) if x1 <= t <= x2]
-    )
-    if y_zoom:
-        y_min = min(y_zoom)
-        y_max = max(y_zoom)
-        pad = 0.05 * max(1e-6, y_max - y_min)
-        axins.set_ylim(y_min - pad, y_max + pad)
-    axins.grid(True, alpha=0.3)
-    axins.tick_params(labelsize=7, pad=1)
-    axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
-    mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
+    if should_show_zoom_inset("cond_numbers_and_min_eigenvalues"):
+        x_center = failure_center_time()
+        x1 = x_center - zoom_half_window
+        x2 = x_center + zoom_half_window
+        axins = inset_axes(
+            axp,
+            width="40%",
+            height="40%",
+            loc="upper left",
+            bbox_to_anchor=(0.04, -0.2, 1, 1),
+            bbox_transform=axp.transAxes,
+        )
+        axins.plot(t_eig_pre_rot, cond_eig_pre_rot)
+        axins.plot(t_eig_post_rot, cond_eig_post_rot)
+        add_marker_line(axins, linewidth=1, include_label=False)
+        axins.set_xlim(x1, x2)
+        y_zoom = (
+            [v for t, v in zip(t_eig_pre_rot, cond_eig_pre_rot) if x1 <= t <= x2] +
+            [v for t, v in zip(t_eig_post_rot, cond_eig_post_rot) if x1 <= t <= x2]
+        )
+        if y_zoom:
+            y_min = min(y_zoom)
+            y_max = max(y_zoom)
+            pad = 0.05 * max(1e-6, y_max - y_min)
+            axins.set_ylim(y_min - pad, y_max + pad)
+        axins.grid(True, alpha=0.3)
+        axins.tick_params(labelsize=7, pad=1)
+        axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
+        mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
 
     axp = axs[1, 0]
     axp.plot(t_eig_pre_trans, min_eig_pre_trans, label=r"$\lambda_{\min}$ (pre translation)")
     axp.plot(t_eig_post_trans, min_eig_post_trans, label=r"$\lambda_{\min}$ (post translation)")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Minimum Eigenvalue - Translation")
     axp.set_xlabel("time [s]")
     axp.set_ylabel("minimum eigenvalue")
     axp.grid(True)
     axp.legend()
-    axins = inset_axes(
-        axp,
-        width="40%",
-        height="40%",
-        loc="upper right",
-        bbox_to_anchor=(-0.04, -0.2, 1, 1),
-        bbox_transform=axp.transAxes,
-    )
-    axins.plot(t_eig_pre_trans, min_eig_pre_trans)
-    axins.plot(t_eig_post_trans, min_eig_post_trans)
-    axins.axvline(x=t_marker, color="r", linestyle="--", linewidth=1)
-    axins.set_xlim(x1, x2)
-    y_zoom = (
-        [v for t, v in zip(t_eig_pre_trans, min_eig_pre_trans) if x1 <= t <= x2] +
-        [v for t, v in zip(t_eig_post_trans, min_eig_post_trans) if x1 <= t <= x2]
-    )
-    if y_zoom:
-        y_min = min(y_zoom)
-        y_max = max(y_zoom)
-        pad = 0.05 * max(1e-6, y_max - y_min)
-        axins.set_ylim(y_min - pad, y_max + pad)
-    axins.grid(True, alpha=0.3)
-    axins.tick_params(labelsize=7, pad=1)
-    axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
-    mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
+    if should_show_zoom_inset("cond_numbers_and_min_eigenvalues"):
+        x_center = failure_center_time()
+        x1 = x_center - zoom_half_window
+        x2 = x_center + zoom_half_window
+        axins = inset_axes(
+            axp,
+            width="40%",
+            height="40%",
+            loc="upper right",
+            bbox_to_anchor=(-0.04, -0.2, 1, 1),
+            bbox_transform=axp.transAxes,
+        )
+        axins.plot(t_eig_pre_trans, min_eig_pre_trans)
+        axins.plot(t_eig_post_trans, min_eig_post_trans)
+        add_marker_line(axins, linewidth=1, include_label=False)
+        axins.set_xlim(x1, x2)
+        y_zoom = (
+            [v for t, v in zip(t_eig_pre_trans, min_eig_pre_trans) if x1 <= t <= x2] +
+            [v for t, v in zip(t_eig_post_trans, min_eig_post_trans) if x1 <= t <= x2]
+        )
+        if y_zoom:
+            y_min = min(y_zoom)
+            y_max = max(y_zoom)
+            pad = 0.05 * max(1e-6, y_max - y_min)
+            axins.set_ylim(y_min - pad, y_max + pad)
+        axins.grid(True, alpha=0.3)
+        axins.tick_params(labelsize=7, pad=1)
+        axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
+        mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
 
     axp = axs[1, 1]
     axp.plot(t_eig_pre_rot, min_eig_pre_rot, label=r"$\lambda_{\min}$ (pre rotation)")
     axp.plot(t_eig_post_rot, min_eig_post_rot, label=r"$\lambda_{\min}$ (post rotation)")
-    axp.axvline(x=t_marker, color="r", linestyle="--", linewidth=2, label="failure time")
+    add_marker_line(axp)
     axp.set_title("Minimum Eigenvalue - Rotation")
     axp.set_xlabel("time [s]")
     axp.set_ylabel("minimum eigenvalue")
     axp.grid(True)
     axp.legend()
-    axins = inset_axes(
-        axp,
-        width="40%",
-        height="40%",
-        loc="upper right",
-        bbox_to_anchor=(-0.04, -0.2, 1, 1),
-        bbox_transform=axp.transAxes,
-    )
-    axins.plot(t_eig_pre_rot, min_eig_pre_rot)
-    axins.plot(t_eig_post_rot, min_eig_post_rot)
-    axins.axvline(x=t_marker, color="r", linestyle="--", linewidth=1)
-    axins.set_xlim(x1, x2)
-    y_zoom = (
-        [v for t, v in zip(t_eig_pre_rot, min_eig_pre_rot) if x1 <= t <= x2] +
-        [v for t, v in zip(t_eig_post_rot, min_eig_post_rot) if x1 <= t <= x2]
-    )
-    if y_zoom:
-        y_min = min(y_zoom)
-        y_max = max(y_zoom)
-        pad = 0.05 * max(1e-6, y_max - y_min)
-        axins.set_ylim(y_min - pad, y_max + pad)
-    axins.grid(True, alpha=0.3)
-    axins.tick_params(labelsize=7, pad=1)
-    axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
-    mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
+    if should_show_zoom_inset("cond_numbers_and_min_eigenvalues"):
+        x_center = failure_center_time()
+        x1 = x_center - zoom_half_window
+        x2 = x_center + zoom_half_window
+        axins = inset_axes(
+            axp,
+            width="40%",
+            height="40%",
+            loc="upper right",
+            bbox_to_anchor=(-0.04, -0.2, 1, 1),
+            bbox_transform=axp.transAxes,
+        )
+        axins.plot(t_eig_pre_rot, min_eig_pre_rot)
+        axins.plot(t_eig_post_rot, min_eig_post_rot)
+        add_marker_line(axins, linewidth=1, include_label=False)
+        axins.set_xlim(x1, x2)
+        y_zoom = (
+            [v for t, v in zip(t_eig_pre_rot, min_eig_pre_rot) if x1 <= t <= x2] +
+            [v for t, v in zip(t_eig_post_rot, min_eig_post_rot) if x1 <= t <= x2]
+        )
+        if y_zoom:
+            y_min = min(y_zoom)
+            y_max = max(y_zoom)
+            pad = 0.05 * max(1e-6, y_max - y_min)
+            axins.set_ylim(y_min - pad, y_max + pad)
+        axins.grid(True, alpha=0.3)
+        axins.tick_params(labelsize=7, pad=1)
+        axins.set_facecolor((1.0, 1.0, 1.0, 0.9))
+        mark_inset(axp, axins, loc1=2, loc2=4, fc="none", ec="0.5")
 
     fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
