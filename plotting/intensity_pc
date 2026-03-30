@@ -1,0 +1,71 @@
+import open3d as o3d
+from pypcd4 import PointCloud
+import numpy as np
+
+
+def plot_pcd(pcd_file):
+
+    np_pcd = np.load(pcd_file)
+
+    print(np_pcd.shape)
+
+    # Convert the numpy array to an Open3D point cloud
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(
+        np_pcd[:, :3]
+    )  # Assuming the first three columns are x, y, z
+
+    gray = np_pcd[:, 3] / 255.0  # Assuming the fourth column is intensity
+    color = np.repeat(gray[:, np.newaxis], 3, axis=1)  # Convert to RGB
+    pcd.colors = o3d.utility.Vector3dVector(
+        color
+    )  # Assuming the next three columns are RGB values
+    # pcd.intensity = o3d.utility.IntVector(np_pcd[:, 3])  # Assuming the last column is intensity
+
+    mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=0.6, origin=[0, 0, 0]
+    )
+
+    o3d.visualization.draw_geometries([mesh_frame, pcd])
+
+    return
+
+
+def pcd_to_npy(pcd_file, npy_file):
+    # Load the PCD file
+    # pcd = o3d.io.read_point_cloud(pcd_file)
+
+    pcd = PointCloud.from_path(pcd_file)
+    pc_data = pcd.pc_data
+
+    # Convert to numpy array
+    points = np.column_stack(
+        (pc_data["x"], pc_data["y"], pc_data["z"], pc_data["intensity"])
+    )
+
+    # Save to .npy file
+    if npy_file == "":
+        npy_file = pcd_file.replace(".pcd", ".npy")
+    np.save(npy_file, points)
+
+
+if __name__ == "__main__":
+    # # pcd_file = "/home/stefan/experiments/lidar_calibration_acsc/sample/pcds/000000.npy"
+    # pcd_file = (
+    #     "/home/stefan/experiments/lidar_calibration_acsc/office_lidar/pcds/000000.npy"
+    # )
+    # plot_pcd(pcd_file)
+
+    pcd_path = "/home/andres/semester_project/data/tinamu_failure_data/cameroon_fail_short/scan_100_to_400.pcd" # cameroon_fail_short
+    # pcd_path = "/home/andres/semester_project/data/tinamu_failure_data/drift_gtc/scans.pcd" # drift_gtc
+    # pcd_path = "/home/andres/semester_project/data/tinamu_failure_data/silo_fail/scans.pcd" # silo_fail
+
+    pcd_file = (
+        pcd_path
+    )
+    pcd_to_npy(pcd_file, "")
+
+    pcd_file = (
+        pcd_path.replace(".pcd", ".npy")
+    )
+    plot_pcd(pcd_file)
