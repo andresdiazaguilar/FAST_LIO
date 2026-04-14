@@ -105,6 +105,20 @@ bool g_have_pre_weakest_dirs = false;
 
 ros::Publisher pubDegPost;
 
+// ---- D^2-LIO adaptive outlier filter (Eq. 7) ----
+// Per-point threshold eps_j = |dt| + 2*r*sin(dtheta/2), replacing Gate 2
+// (s = 1 - 0.9*|pd2|/sqrt(r) > 0.9) in h_share_model when enabled.
+bool   d2_use_outlier_filter = false;
+double d2_eps_min = 0.05;   // meters, clamp lower bound on eps_j
+double d2_eps_max = 2.0;    // meters, clamp upper bound on eps_j
+bool   d2_have_last_pose = false;
+M3D    d2_last_R = Eye3d;
+V3D    d2_last_p = Zero3d;
+double d2_delta_t_norm = 0.0;
+double d2_sin_half_dtheta = 0.0;
+bool   d2_scan_motion_ready = false;
+ros::Publisher pubD2OutlierStats;
+
 // ---- Structural diagnostics (edge / plane counter) ----
 StructuralDiagnostics struct_diag;
 
@@ -857,10 +871,31 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         point_selected_surf[i] = false;
         if (esti_plane(pabcd, points_near, 0.1f))
         {
+            // signed point-to-plane distance in meters
             float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
-            float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
 
-            if (s > 0.9)
+            bool accept = false;
+            if (d2_use_outlier_filter && d2_scan_motion_ready)
+            {
+                // D^2-LIO adaptive threshold (Eq. 7): eps_j = |dt| + 2*r*sin(dtheta/2).
+                // Bounds how far a valid correspondence could have moved between scans
+                // under the scan-to-scan rigid-body motion.
+
+                V3D p_imu = s.offset_R_L_I * p_body + s.offset_T_L_I; // point in IMU/body frame
+                double r = p_imu.norm();
+
+                double eps_j = d2_delta_t_norm + 2.0 * r * d2_sin_half_dtheta;
+                if (eps_j < d2_eps_min) eps_j = d2_eps_min;
+                if (eps_j > d2_eps_max) eps_j = d2_eps_max;
+                accept = (std::fabs(pd2) <= eps_j);
+            }
+            else
+            {
+                float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+                accept = (s > 0.9);
+            }
+
+            if (accept)
             {
                 point_selected_surf[i] = true;
                 normvec->points[i].x = pabcd(0);
@@ -1134,6 +1169,7 @@ int main(int argc, char** argv)
     pubGyroBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gyro_bias", 1000);
     pubAccelBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/accel_bias", 1000);
     pubGravityEstimate = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gravity_estimate", 1000);
+    pubD2OutlierStats = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/d2_outlier_stats", 1000);
 
     // ---- Structural diagnostics setup ----
     struct_diag.init(nh);
@@ -1148,6 +1184,9 @@ int main(int argc, char** argv)
     nh.param<string>("common/imu_topic", imu_topic,"/livox/imu");
     nh.param<bool>("common/time_sync_en", time_sync_en, false);
     nh.param<double>("common/time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
+    nh.param<bool>("common/use_d2_outlier_filter", d2_use_outlier_filter, false);
+    nh.param<double>("common/d2_eps_min", d2_eps_min, 0.05);
+    nh.param<double>("common/d2_eps_max", d2_eps_max, 2.0);
     nh.param<double>("filter_size_corner",filter_size_corner_min,0.5);
     nh.param<double>("filter_size_surf",filter_size_surf_min,0.5);
     nh.param<double>("filter_size_map",filter_size_map_min,0.5);
@@ -1268,6 +1307,26 @@ int main(int argc, char** argv)
             p_imu->Process(Measures, kf, feats_undistort);
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+
+            // ---- D^2-LIO scan-to-scan motion summary (used as the per-scan eps_j bound) ----
+            // Computed once per scan from the last converged pose to the current propagated pose,
+            // so the threshold stays fixed across IEKF iterations (cannot oscillate).
+            if (d2_use_outlier_filter && d2_have_last_pose)
+            {
+                M3D R_cur = state_point.rot.toRotationMatrix();
+                M3D dR = d2_last_R.transpose() * R_cur;
+                V3D dp = state_point.pos - d2_last_p;
+                d2_delta_t_norm = dp.norm();
+                double dtheta = Log(dR).norm();
+                d2_sin_half_dtheta = std::sin(0.5 * dtheta);
+                d2_scan_motion_ready = true;
+            }
+            else
+            {
+                d2_scan_motion_ready = false;
+                d2_delta_t_norm = 0.0;
+                d2_sin_half_dtheta = 0.0;
+            }
 
             int imu_count = Measures.imu.size();
             double omega_norm_sum = 0.0;
@@ -1446,6 +1505,25 @@ int main(int argc, char** argv)
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+
+            // ---- Cache converged pose for next-scan D^2-LIO Delta-pose ----
+            d2_last_R = state_point.rot.toRotationMatrix();
+            d2_last_p = state_point.pos;
+            d2_have_last_pose = true;
+
+            // ---- D^2-LIO per-scan diagnostic stats ----
+            {
+                std_msgs::Float64MultiArray d2_msg;
+                d2_msg.data.resize(6);
+                d2_msg.data[0] = lidar_end_time;
+                d2_msg.data[1] = d2_use_outlier_filter ? 1.0 : 0.0;
+                d2_msg.data[2] = d2_scan_motion_ready ? 1.0 : 0.0;
+                d2_msg.data[3] = d2_delta_t_norm;
+                d2_msg.data[4] = d2_sin_half_dtheta;
+                d2_msg.data[5] = static_cast<double>(effct_feat_num);
+                pubD2OutlierStats.publish(d2_msg);
+            }
+
             geoQuat.x = state_point.rot.coeffs()[0];
             geoQuat.y = state_point.rot.coeffs()[1];
             geoQuat.z = state_point.rot.coeffs()[2];
