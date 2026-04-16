@@ -14,6 +14,7 @@ degeneracy:
     # DRPM update rule: x = U P Lambda^-1 U^T J^T b, P = diag(p_1..p_6), p_k in [0,1].
     # With enable=false, the filter is byte-identical to baseline FAST-LIO2.
     enable: true
+    force_all_probabilities_one: true  # true: force all p_k=1 while keeping mitigation path active for testing
     probability_mode: "probabilistic"   # "heuristic" | "probabilistic"
     heuristic_mode:   "soft"        # "hard" | "soft" | "sigmoid"
     # Hard-threshold mode: p_k = 1 if lambda_k > lambda_min else 0

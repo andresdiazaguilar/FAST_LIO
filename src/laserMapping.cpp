@@ -134,6 +134,7 @@ enum DegenProbMode      { DEGEN_PROB_HEURISTIC = 0, DEGEN_PROB_PROBABILISTIC = 1
 struct DegeneracyConfig
 {
     bool   enable                 = false;
+    bool   force_all_probs_one    = false;
     int    prob_mode              = DEGEN_PROB_HEURISTIC;
     int    heur_mode              = DEGEN_HEUR_SOFT;
     double hard_lambda_min_trans  = 100.0;
@@ -1397,6 +1398,10 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                             H_drpm, noise_mean, noise_var, V, g_degen_cfg.snr_factor);
 
                         drpm_probs = drpm_probs.cwiseMax(0.0).cwiseMin(1.0);
+                        if (g_degen_cfg.force_all_probs_one)
+                        {
+                            drpm_probs.setOnes();
+                        }
 
                         // --- Step 4: B_drpm = V * diag(p) * V^T, A_drpm = V * diag(sqrt(p)) * V^T ---
                         Eigen::Matrix<double, 6, 1> sqrt_p = drpm_probs.cwiseSqrt();
@@ -1480,6 +1485,16 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
                     if (ok_t && ok_r)
                     {
+                        if (g_degen_cfg.force_all_probs_one)
+                        {
+                            p_t.setOnes();
+                            p_r.setOnes();
+                            At.setIdentity();
+                            Ar.setIdentity();
+                            Bt.setIdentity();
+                            Br.setIdentity();
+                        }
+
                         ekfom_data.degen_mitigation_en = true;
                         ekfom_data.degen_pose_rhs_projector.setZero();
                         ekfom_data.degen_pose_rhs_projector.block<3,3>(0,0) = Bt;
@@ -1549,6 +1564,11 @@ int main(int argc, char** argv)
 
     // ---- Degeneracy mitigation parameters ----
     nh.param<bool>("degeneracy/enable", g_degen_cfg.enable, false);
+    nh.param<bool>("degeneracy/force_all_probabilities_one", g_degen_cfg.force_all_probs_one, false);
+    if (g_degen_cfg.enable && g_degen_cfg.force_all_probs_one)
+    {
+        ROS_WARN("[DRPM] degeneracy/force_all_probabilities_one is true; all degeneracy probabilities are forced to 1.");
+    }
     {
         std::string prob_mode_str, heur_mode_str;
         nh.param<std::string>("degeneracy/probability_mode", prob_mode_str, std::string("heuristic"));
