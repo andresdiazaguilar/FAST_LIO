@@ -8,6 +8,32 @@ common:
     d2_eps_min: 0.05              # Lower clamp on eps_j in meters (avoids collapse when the platform is near-static).
     d2_eps_max: 2.0               # Upper clamp on eps_j in meters (guards against runaway thresholds on bad motion estimates).
 
+degeneracy:
+    # Probabilistic degeneracy mitigation (Week 7).  When enabled, attenuates the
+    # pose columns of the LiDAR Jacobian along eigen-directions judged degenerate.
+    # H_pose -> H_pose * A with  A = U P^{1/2} U^T, P = diag(p_1..p_6), p_k in [0,1].
+    # With enable=false, the filter is byte-identical to baseline FAST-LIO2.
+    enable: true
+    probability_mode: "probabilistic"   # "heuristic" | "probabilistic"
+    heuristic_mode:   "soft"        # "hard" | "soft" | "sigmoid"
+    # Hard-threshold mode: p_k = 1 if lambda_k > lambda_min else 0
+    hard_lambda_min_trans: 100.0
+    hard_lambda_min_rot:   100.0
+    # Soft-threshold mode: p_k = lambda_k / (lambda_k + alpha)
+    soft_alpha_trans:      100.0
+    soft_alpha_rot:        100.0
+    # Sigmoid mode:        p_k = sigmoid((lambda_k - tau) / s)
+    sigmoid_tau_trans:     100.0
+    sigmoid_tau_rot:       100.0
+    sigmoid_s_trans:        50.0
+    sigmoid_s_rot:          50.0
+    # DRPM probabilistic mode (probability_mode: "probabilistic"):
+    # Uses signal-to-noise ratio framework from Hatleskog & Alexis (arXiv:2410.10784).
+    # Computes per-direction non-degeneracy probability via noise characterization.
+    snr_factor:             10.0    # signal must be snr_factor x noise to be judged non-degenerate
+    stdev_points:           0.02    # point measurement noise std dev [m] (from LiDAR datasheet)
+    stdev_normals:          0.05    # normal estimation noise std dev [rad-equivalent]
+
 preprocess:
     lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
     scan_line: 4

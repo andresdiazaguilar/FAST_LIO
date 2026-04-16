@@ -65,6 +65,7 @@
 #include <std_msgs/Float64.h>
 #include <Eigen/Eigenvalues>
 #include "structural_diagnostics.h"
+#include "drpm_degeneracy.h"
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -121,6 +122,40 @@ ros::Publisher pubD2OutlierStats;
 
 // ---- Structural diagnostics (edge / plane counter) ----
 StructuralDiagnostics struct_diag;
+
+// ---- Probabilistic degeneracy mitigation ----
+// Attenuates the pose part of the LiDAR Jacobian along eigen-directions judged
+// degenerate: H_pose -> H_pose * A, with A = U P^{1/2} U^T.  P is a diagonal
+// matrix of per-direction "non-degeneracy" probabilities p_k in [0, 1].
+// With P = I the update is byte-identical to the baseline FAST-LIO2.
+enum DegenHeuristicMode { DEGEN_HEUR_HARD = 0, DEGEN_HEUR_SOFT = 1, DEGEN_HEUR_SIGMOID = 2 };
+enum DegenProbMode      { DEGEN_PROB_HEURISTIC = 0, DEGEN_PROB_PROBABILISTIC = 1 };
+
+struct DegeneracyConfig
+{
+    bool   enable                 = false;
+    int    prob_mode              = DEGEN_PROB_HEURISTIC;
+    int    heur_mode              = DEGEN_HEUR_SOFT;
+    double hard_lambda_min_trans  = 100.0;
+    double hard_lambda_min_rot    = 100.0;
+    double soft_alpha_trans       = 100.0;
+    double soft_alpha_rot         = 100.0;
+    double sigmoid_tau_trans      = 100.0;
+    double sigmoid_tau_rot        = 100.0;
+    double sigmoid_s_trans        = 50.0;
+    double sigmoid_s_rot          = 50.0;
+
+    // ---- Parameters for probability_mode = "probabilistic" (DRPM-style) ----
+    // See drpm_degeneracy.h / reference_repos/drpm.  The computation is done
+    // in the LiDAR/IMU body frame; the resulting 6x6 A matrix is rotated back
+    // into FAST-LIO2's state convention before being applied.
+    double snr_factor             = 10.0;   // signal / noise ratio threshold s
+    double stdev_points           = 0.02;   // meters, per-point range noise std
+    double stdev_normals          = 0.05;   // rad-equivalent, isotropic normal noise std
+};
+DegeneracyConfig g_degen_cfg;
+ros::Publisher   pubDegenProbs;
+ros::Publisher   pubDegenProbsFull;
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
@@ -829,6 +864,76 @@ void publish_arrow_marker_vec(const ros::Publisher &pub,
     pub.publish(marker);
 }
 
+// ---------------------------------------------------------------------------
+// Degeneracy mitigation helpers
+// ---------------------------------------------------------------------------
+
+// Heuristic probability of a direction being NON-degenerate, given the
+// corresponding eigenvalue of the LiDAR pose information matrix (one block).
+// Returns p in [0, 1]; p -> 1 means keep the update, p -> 0 means suppress it.
+static inline double degen_heuristic_prob(double lambda,
+                                          int heur_mode,
+                                          double hard_lambda_min,
+                                          double soft_alpha,
+                                          double sigmoid_tau,
+                                          double sigmoid_s)
+{
+    // Negative eigenvalues can appear due to numerical noise; clamp them.
+    if (!std::isfinite(lambda) || lambda <= 0.0) return 0.0;
+
+    switch (heur_mode)
+    {
+        case DEGEN_HEUR_HARD:
+            return (lambda > hard_lambda_min) ? 1.0 : 0.0;
+
+        case DEGEN_HEUR_SIGMOID: {
+            const double s = std::max(sigmoid_s, 1e-12);
+            return 1.0 / (1.0 + std::exp(-(lambda - sigmoid_tau) / s));
+        }
+
+        case DEGEN_HEUR_SOFT:
+        default:
+            return lambda / (lambda + std::max(soft_alpha, 1e-12));
+    }
+}
+
+// Build A = U P^{1/2} U^T for one 3x3 information block.
+// Returns true if the eigen-decomposition succeeded and fills `A` and `probs`.
+// Eigenvalues and probabilities are returned in the (ascending) order produced
+// by SelfAdjointEigenSolver.
+static bool degen_build_block_A(const Eigen::Matrix3d &Lambda_block,
+                                int heur_mode,
+                                double hard_lambda_min,
+                                double soft_alpha,
+                                double sigmoid_tau,
+                                double sigmoid_s,
+                                Eigen::Matrix3d &A,
+                                Eigen::Vector3d &eigvals,
+                                Eigen::Vector3d &probs)
+{
+    if (!Lambda_block.allFinite()) return false;
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(Lambda_block);
+    if (es.info() != Eigen::Success) return false;
+
+    eigvals = es.eigenvalues();
+    const Eigen::Matrix3d &U = es.eigenvectors();
+
+    Eigen::Vector3d sqrt_p;
+    for (int k = 0; k < 3; ++k)
+    {
+        double p = degen_heuristic_prob(eigvals(k), heur_mode,
+                                        hard_lambda_min, soft_alpha,
+                                        sigmoid_tau, sigmoid_s);
+        p = std::max(0.0, std::min(1.0, p));
+        probs(k)  = p;
+        sqrt_p(k) = std::sqrt(p);
+    }
+
+    A = U * sqrt_p.asDiagonal() * U.transpose();
+    return true;
+}
+
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
@@ -1144,6 +1249,193 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 msg.data[11] = acc_norm_no_gravity_mean;
                 pubDeg.publish(msg);
             }
+
+            // -----------------------------------------------------------------
+            // Degeneracy mitigation: H_pose <- H_pose * A, per-block
+            // A_t = U_t P_t^{1/2} U_t^T built from  Lambda_t = H_t^T H_t / sigma^2
+            // A_r = U_r P_r^{1/2} U_r^T built from  Lambda_r = H_r^T H_r / sigma^2
+            // Rotation and translation are treated as two 3x3 blocks because their
+            // eigenvalue scales differ (units, feature distances). The extrinsic
+            // columns (6..11) are left untouched.
+            // -----------------------------------------------------------------
+            if (g_degen_cfg.enable && ekfom_data.h_x.rows() > 0 && ekfom_data.h_x.cols() >= 6)
+            {
+                if (g_degen_cfg.prob_mode == DEGEN_PROB_PROBABILISTIC)
+                {
+                    // =========================================================
+                    // DRPM probabilistic degeneracy mitigation (full 6-DOF).
+                    //
+                    // 1. Collect body-frame points and normals from the current
+                    //    effective correspondences.
+                    // 2. Build the 6x6 DRPM Hessian in body-frame [rot, trans]
+                    //    convention:  v = [p x n; n],  H = sum w * v * v^T.
+                    // 3. Eigendecompose, compute noise statistics and
+                    //    per-direction non-degeneracy probabilities p_k.
+                    // 4. Build A_drpm = U * diag(sqrt(p)) * U^T.
+                    // 5. Transform A to FAST-LIO2's [trans_world, rot_body]
+                    //    convention:  A_flio = M * A_drpm * M^T,
+                    //    M = [0 R; I 0].
+                    // 6. Apply:  H_pose <- H_pose * A_flio.
+                    // =========================================================
+                    const int N = effct_feat_num;
+                    const double inv_R = 1.0 / std::max(LASER_POINT_COV, 1e-12);
+
+                    // --- Step 1: body-frame points & normals ---
+                    degeneracy::VectorVector3<double> body_pts(N);
+                    degeneracy::VectorVector3<double> body_nrm(N);
+                    std::vector<double> drpm_weights(N, inv_R);
+
+                    const Eigen::Matrix3d R_LI = s.offset_R_L_I.toRotationMatrix();
+                    const Eigen::Vector3d t_LI(s.offset_T_L_I(0), s.offset_T_L_I(1), s.offset_T_L_I(2));
+                    const Eigen::Matrix3d R_inv = s.rot.conjugate().toRotationMatrix();
+
+                    for (int i = 0; i < N; ++i)
+                    {
+                        const PointType &lp = laserCloudOri->points[i];
+                        Eigen::Vector3d p_lidar(lp.x, lp.y, lp.z);
+                        body_pts[i] = R_LI * p_lidar + t_LI;  // point in IMU body frame
+
+                        const PointType &np = corr_normvect->points[i];
+                        Eigen::Vector3d n_w(np.x, np.y, np.z);
+                        body_nrm[i] = R_inv * n_w;            // normal in IMU body frame
+                    }
+
+                    // --- Step 2: DRPM Hessian [rot(3), trans(3)] body frame ---
+                    Eigen::Matrix<double, 6, 6> H_drpm = Eigen::Matrix<double, 6, 6>::Zero();
+                    for (int i = 0; i < N; ++i)
+                    {
+                        const double w = std::sqrt(drpm_weights[i]);
+                        Eigen::Matrix<double, 6, 1> v;
+                        v.head(3) = w * body_pts[i].cross(body_nrm[i]);
+                        v.tail(3) = w * body_nrm[i];
+                        H_drpm.noalias() += v * v.transpose();
+                    }
+
+                    // --- Step 3: eigendecompose ---
+                    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es_drpm(H_drpm);
+
+                    // Fallback eigenvalues / probs for diagnostics in case of failure.
+                    Eigen::Matrix<double, 6, 1> drpm_eigenvalues = Eigen::Matrix<double, 6, 1>::Zero();
+                    Eigen::Matrix<double, 6, 1> drpm_probs       = Eigen::Matrix<double, 6, 1>::Ones();
+
+                    if (es_drpm.info() == Eigen::Success && H_drpm.allFinite())
+                    {
+                        const Eigen::Matrix<double, 6, 6>& V  = es_drpm.eigenvectors();
+                        drpm_eigenvalues = es_drpm.eigenvalues();
+
+                        // --- Step 3b: isotropic normal covariances ---
+                        const double var_n = g_degen_cfg.stdev_normals * g_degen_cfg.stdev_normals;
+                        degeneracy::VectorMatrix3<double> normal_covs(N);
+                        for (int i = 0; i < N; ++i)
+                            normal_covs[i] = Eigen::Matrix3d::Identity() * var_n;
+
+                        // --- Step 3c: noise estimate ---
+                        Eigen::Matrix<double, 6, 6> noise_mean;
+                        Eigen::Matrix<double, 6, 1> noise_var;
+                        std::tie(noise_mean, noise_var) =
+                            degeneracy::ComputeNoiseEstimate<double, double>(
+                                body_pts, body_nrm, drpm_weights,
+                                normal_covs, V, g_degen_cfg.stdev_points);
+
+                        // --- Step 3d: per-direction probabilities ---
+                        drpm_probs = degeneracy::ComputeSignalToNoiseProbabilities<double>(
+                            H_drpm, noise_mean, noise_var, V, g_degen_cfg.snr_factor);
+
+                        drpm_probs = drpm_probs.cwiseMax(0.0).cwiseMin(1.0);
+
+                        // --- Step 4: A_drpm = V * diag(sqrt(p)) * V^T ---
+                        Eigen::Matrix<double, 6, 1> sqrt_p = drpm_probs.cwiseSqrt();
+                        Eigen::Matrix<double, 6, 6> A_drpm =
+                            V * sqrt_p.asDiagonal() * V.transpose();
+
+                        // --- Step 5: transform to FAST-LIO2 convention ---
+                        // DRPM uses [rot(3), trans(3)] in body frame.
+                        // FAST-LIO2 H_pose columns are [trans_world(3), rot_body(3)].
+                        // Mapping:  x_flio = M * x_drpm,  M = [0  R; I  0].
+                        // A_flio = M * A_drpm * M^T.
+                        //   A_flio[tt] = R * A_drpm[tt] * R^T
+                        //   A_flio[tr] = R * A_drpm[tr]          (tr = bottom-left in DRPM = trans,rot)
+                        //   A_flio[rt] = A_flio[tr]^T
+                        //   A_flio[rr] = A_drpm[rr]
+                        // where A_drpm blocks are indexed as [rr(0:3,0:3), rt(0:3,3:6); tr(3:6,0:3), tt(3:6,3:6)].
+                        const Eigen::Matrix3d R_mat = s.rot.toRotationMatrix();
+
+                        Eigen::Matrix<double, 6, 6> A_flio;
+                        A_flio.block<3,3>(0,0) = R_mat * A_drpm.block<3,3>(3,3) * R_mat.transpose(); // trans-trans
+                        A_flio.block<3,3>(0,3) = R_mat * A_drpm.block<3,3>(3,0);                     // trans-rot
+                        A_flio.block<3,3>(3,0) = A_flio.block<3,3>(0,3).transpose();                 // rot-trans (symmetric)
+                        A_flio.block<3,3>(3,3) = A_drpm.block<3,3>(0,0);                             // rot-rot
+
+                        // --- Step 6: apply H_pose <- H_pose * A_flio ---
+                        ekfom_data.h_x.leftCols(6) = Hpose * A_flio;
+                    }
+                    else
+                    {
+                        ROS_WARN_THROTTLE(2.0, "[DRPM] Eigendecomposition failed or non-finite Hessian; "
+                                               "skipping degeneracy mitigation this iteration.");
+                    }
+
+                    // Diagnostics: publish 6 eigenvalues + 6 probabilities.
+                    // Layout: [time, N, eig0..eig5, p0..p5, mode=1]
+                    std_msgs::Float64MultiArray dmsg;
+                    dmsg.data.resize(15);
+                    dmsg.data[0]  = lidar_end_time;
+                    dmsg.data[1]  = static_cast<double>(effct_feat_num);
+                    // Eigenvalues and probs in DRPM order [rot0 rot1 rot2 trans0 trans1 trans2]
+                    for (int k = 0; k < 6; ++k) dmsg.data[2 + k]  = drpm_eigenvalues(k);
+                    for (int k = 0; k < 6; ++k) dmsg.data[8 + k]  = drpm_probs(k);
+                    dmsg.data[14] = static_cast<double>(DEGEN_PROB_PROBABILISTIC);
+                    pubDegenProbs.publish(dmsg);
+                }
+                else
+                {
+                    // =========================================================
+                    // Heuristic degeneracy mitigation (per-block 3x3).
+                    // =========================================================
+                    const double sigma2 = std::max(LASER_POINT_COV, 1e-12);
+                    Eigen::Matrix3d Lambda_t = (Hpose.leftCols(3).transpose() * Hpose.leftCols(3)) / sigma2;
+                    Eigen::Matrix3d Lambda_r = (Hpose.rightCols(3).transpose() * Hpose.rightCols(3)) / sigma2;
+
+                    Eigen::Matrix3d At = Eigen::Matrix3d::Identity();
+                    Eigen::Matrix3d Ar = Eigen::Matrix3d::Identity();
+                    Eigen::Vector3d eig_t = Eigen::Vector3d::Zero();
+                    Eigen::Vector3d eig_r = Eigen::Vector3d::Zero();
+                    Eigen::Vector3d p_t   = Eigen::Vector3d::Ones();
+                    Eigen::Vector3d p_r   = Eigen::Vector3d::Ones();
+
+                    bool ok_t = degen_build_block_A(Lambda_t, g_degen_cfg.heur_mode,
+                                                    g_degen_cfg.hard_lambda_min_trans,
+                                                    g_degen_cfg.soft_alpha_trans,
+                                                    g_degen_cfg.sigmoid_tau_trans,
+                                                    g_degen_cfg.sigmoid_s_trans,
+                                                    At, eig_t, p_t);
+                    bool ok_r = degen_build_block_A(Lambda_r, g_degen_cfg.heur_mode,
+                                                    g_degen_cfg.hard_lambda_min_rot,
+                                                    g_degen_cfg.soft_alpha_rot,
+                                                    g_degen_cfg.sigmoid_tau_rot,
+                                                    g_degen_cfg.sigmoid_s_rot,
+                                                    Ar, eig_r, p_r);
+
+                    if (ok_t && ok_r)
+                    {
+                        // Apply in place to the Jacobian that the IEKF will consume.
+                        ekfom_data.h_x.leftCols(3)       = Hpose.leftCols(3)  * At;
+                        ekfom_data.h_x.block(0, 3, ekfom_data.h_x.rows(), 3) = Hpose.rightCols(3) * Ar;
+                    }
+
+                    // Diagnostics: publish eigenvalues and per-direction probabilities.
+                    std_msgs::Float64MultiArray dmsg;
+                    dmsg.data.resize(15);
+                    dmsg.data[0]  = lidar_end_time;
+                    dmsg.data[1]  = static_cast<double>(effct_feat_num);
+                    dmsg.data[2]  = eig_t(0); dmsg.data[3] = eig_t(1); dmsg.data[4] = eig_t(2);
+                    dmsg.data[5]  = p_t(0);   dmsg.data[6] = p_t(1);   dmsg.data[7] = p_t(2);
+                    dmsg.data[8]  = eig_r(0); dmsg.data[9] = eig_r(1); dmsg.data[10] = eig_r(2);
+                    dmsg.data[11] = p_r(0);   dmsg.data[12] = p_r(1);  dmsg.data[13] = p_r(2);
+                    dmsg.data[14] = static_cast<double>(g_degen_cfg.heur_mode);
+                    pubDegenProbs.publish(dmsg);
+                }
+            }
         }
     }
 }
@@ -1170,6 +1462,7 @@ int main(int argc, char** argv)
     pubAccelBias = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/accel_bias", 1000);
     pubGravityEstimate = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/gravity_estimate", 1000);
     pubD2OutlierStats = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/d2_outlier_stats", 1000);
+    pubDegenProbs = nh.advertise<std_msgs::Float64MultiArray>("/fastlio/degeneracy_probabilities", 1000);
 
     // ---- Structural diagnostics setup ----
     struct_diag.init(nh);
@@ -1187,6 +1480,33 @@ int main(int argc, char** argv)
     nh.param<bool>("common/use_d2_outlier_filter", d2_use_outlier_filter, false);
     nh.param<double>("common/d2_eps_min", d2_eps_min, 0.05);
     nh.param<double>("common/d2_eps_max", d2_eps_max, 2.0);
+
+    // ---- Degeneracy mitigation parameters ----
+    nh.param<bool>("degeneracy/enable", g_degen_cfg.enable, false);
+    {
+        std::string prob_mode_str, heur_mode_str;
+        nh.param<std::string>("degeneracy/probability_mode", prob_mode_str, std::string("heuristic"));
+        nh.param<std::string>("degeneracy/heuristic_mode",   heur_mode_str, std::string("soft"));
+
+        if      (prob_mode_str == "probabilistic") g_degen_cfg.prob_mode = DEGEN_PROB_PROBABILISTIC;
+        else                                       g_degen_cfg.prob_mode = DEGEN_PROB_HEURISTIC;
+
+        if      (heur_mode_str == "hard")    g_degen_cfg.heur_mode = DEGEN_HEUR_HARD;
+        else if (heur_mode_str == "sigmoid") g_degen_cfg.heur_mode = DEGEN_HEUR_SIGMOID;
+        else                                 g_degen_cfg.heur_mode = DEGEN_HEUR_SOFT;
+    }
+    nh.param<double>("degeneracy/hard_lambda_min_trans", g_degen_cfg.hard_lambda_min_trans, 100.0);
+    nh.param<double>("degeneracy/hard_lambda_min_rot",   g_degen_cfg.hard_lambda_min_rot,   100.0);
+    nh.param<double>("degeneracy/soft_alpha_trans",      g_degen_cfg.soft_alpha_trans,      100.0);
+    nh.param<double>("degeneracy/soft_alpha_rot",        g_degen_cfg.soft_alpha_rot,        100.0);
+    nh.param<double>("degeneracy/sigmoid_tau_trans",     g_degen_cfg.sigmoid_tau_trans,     100.0);
+    nh.param<double>("degeneracy/sigmoid_tau_rot",       g_degen_cfg.sigmoid_tau_rot,       100.0);
+    nh.param<double>("degeneracy/sigmoid_s_trans",       g_degen_cfg.sigmoid_s_trans,        50.0);
+    nh.param<double>("degeneracy/sigmoid_s_rot",         g_degen_cfg.sigmoid_s_rot,          50.0);
+    // DRPM probabilistic mode parameters
+    nh.param<double>("degeneracy/snr_factor",            g_degen_cfg.snr_factor,             10.0);
+    nh.param<double>("degeneracy/stdev_points",          g_degen_cfg.stdev_points,           0.02);
+    nh.param<double>("degeneracy/stdev_normals",         g_degen_cfg.stdev_normals,          0.05);
     nh.param<double>("filter_size_corner",filter_size_corner_min,0.5);
     nh.param<double>("filter_size_surf",filter_size_surf_min,0.5);
     nh.param<double>("filter_size_map",filter_size_map_min,0.5);
