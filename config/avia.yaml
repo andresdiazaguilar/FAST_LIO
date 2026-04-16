@@ -36,8 +36,8 @@ pcd_save:
 
 degeneracy:
     # Probabilistic degeneracy mitigation (Week 7).  When enabled, attenuates the
-    # pose columns of the LiDAR Jacobian along eigen-directions judged degenerate.
-    # H_pose -> H_pose * A with  A = U P^{1/2} U^T, P = diag(p_1..p_6), p_k in [0,1].
+    # pose update along eigen-directions judged degenerate.
+    # DRPM update rule: x = U P Lambda^-1 U^T J^T b, P = diag(p_1..p_6), p_k in [0,1].
     # With enable=false, the filter is byte-identical to baseline FAST-LIO2.
     enable: false
     probability_mode: "heuristic"   # "heuristic" | "probabilistic"

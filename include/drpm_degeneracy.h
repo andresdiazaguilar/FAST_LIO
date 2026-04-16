@@ -110,14 +110,20 @@ Eigen::Matrix<T, 6, 1> ComputeSignalToNoiseProbabilities(const Eigen::Matrix<T, 
     const Vector6 u = U.col(k);
     const T measurement = (u.transpose() * measured_information_matrix * u).value();
     const T expected_noise = (u.transpose() * estimated_noise_mean * u).value();
-    const T stdev = std::sqrt(estimated_noise_variances[k]);
+    const T variance = estimated_noise_variances[k];
+    const T stdev = variance > T(0.0) ? std::sqrt(variance) : T(0.0);
     const T test_point = measurement / (T(1.0) + snr_factor);
 
     const bool any_nan = std::isnan(expected_noise) || std::isnan(stdev) || std::isnan(test_point);
 
     if (!any_nan) {
-      const T probability = boost::math::cdf(
-          boost::math::normal_distribution<T>(expected_noise, stdev), test_point);
+      T probability = T(0.0);
+      if (stdev > T(1e-12)) {
+        probability = boost::math::cdf(
+            boost::math::normal_distribution<T>(expected_noise, stdev), test_point);
+      } else {
+        probability = test_point >= expected_noise ? T(1.0) : T(0.0);
+      }
 
       probabilities[k] = probability;
     } else {

@@ -86,6 +86,9 @@ struct dyn_share_datastruct
 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> h_v;
 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> h_x;
 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> R;
+	bool degen_mitigation_en;
+	Eigen::Matrix<T, 6, 6> degen_pose_rhs_projector;
+	Eigen::Matrix<T, 6, 6> degen_pose_jacobian_projector;
 };
 
 //used for iterated error state EKF update
@@ -1004,6 +1007,9 @@ public:
 		dyn_share_datastruct<scalar_type> dyn_share;
 		dyn_share.valid = true;
 		dyn_share.converge = true;
+		dyn_share.degen_mitigation_en = false;
+		dyn_share.degen_pose_rhs_projector.setIdentity();
+		dyn_share.degen_pose_jacobian_projector.setIdentity();
 		state x_propagated = x_;
 		cov P_propagated = P_;
 		int dof_Measurement;
@@ -1011,6 +1017,9 @@ public:
 		for(int i=-1; i<maximum_iter; i++)
 		{
 			dyn_share.valid = true;
+			dyn_share.degen_mitigation_en = false;
+			dyn_share.degen_pose_rhs_projector.setIdentity();
+			dyn_share.degen_pose_jacobian_projector.setIdentity();
 			h_dyn_share (x_,  dyn_share);
 			//Matrix<scalar_type, Eigen::Dynamic, 1> h = h_dyn_share (x_,  dyn_share);
 			Matrix<scalar_type, Eigen::Dynamic, 1> z = dyn_share.z;
@@ -1633,6 +1642,9 @@ public:
 		for(int i=-1; i<maximum_iter; i++)
 		{
 			dyn_share.valid = true;	
+			dyn_share.degen_mitigation_en = false;
+			dyn_share.degen_pose_rhs_projector.setIdentity();
+			dyn_share.degen_pose_jacobian_projector.setIdentity();
 			h_dyn_share(x_, dyn_share);
 
 			if(! dyn_share.valid)
@@ -1712,7 +1724,33 @@ public:
 			}
 			*/
 
-			if(n > dof_Measurement)
+			if(dyn_share.degen_mitigation_en)
+			{
+				Eigen::Matrix<scalar_type, Eigen::Dynamic, 12> h_x_degen = dyn_share.h_x;
+				Eigen::Matrix<scalar_type, 12, 12> HTH = h_x_degen.transpose() * h_x_degen;
+				Eigen::Matrix<scalar_type, 12, 1> HTz = h_x_degen.transpose() * dyn_share.h;
+
+				HTz.template head<6>() = dyn_share.degen_pose_rhs_projector * HTz.template head<6>();
+
+				Eigen::Matrix<scalar_type, 12, 12> HTH_cov = HTH;
+				const Eigen::Matrix<scalar_type, 6, 6> A_pose = dyn_share.degen_pose_jacobian_projector;
+				HTH_cov.template block<6, 6>(0, 0) =
+					A_pose * HTH.template block<6, 6>(0, 0) * A_pose;
+				HTH_cov.template block<6, 6>(0, 6) =
+					A_pose * HTH.template block<6, 6>(0, 6);
+				HTH_cov.template block<6, 6>(6, 0) =
+					HTH.template block<6, 6>(6, 0) * A_pose;
+
+				cov P_temp = (P_/R).inverse();
+				P_temp. template block<12, 12>(0, 0) += HTH;
+				cov P_inv = P_temp.inverse();
+
+				K_h = P_inv. template block<n, 12>(0, 0) * HTz;
+				K_x.setZero();
+				K_x. template block<n, 12>(0, 0) =
+					P_inv. template block<n, 12>(0, 0) * HTH_cov;
+			}
+			else if(n > dof_Measurement)
 			{
 			//#ifdef USE_sparse
 				//Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> K_temp = h_x * P_ * h_x.transpose();

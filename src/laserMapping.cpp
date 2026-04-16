@@ -124,10 +124,10 @@ ros::Publisher pubD2OutlierStats;
 StructuralDiagnostics struct_diag;
 
 // ---- Probabilistic degeneracy mitigation ----
-// Attenuates the pose part of the LiDAR Jacobian along eigen-directions judged
-// degenerate: H_pose -> H_pose * A, with A = U P^{1/2} U^T.  P is a diagonal
-// matrix of per-direction "non-degeneracy" probabilities p_k in [0, 1].
-// With P = I the update is byte-identical to the baseline FAST-LIO2.
+// Attenuates the pose update along eigen-directions judged degenerate following
+// the DRPM rule x = U P Lambda^-1 U^T J^T b. P is a diagonal matrix of
+// per-direction "non-degeneracy" probabilities p_k in [0, 1].
+// With P = I the update reduces to the baseline FAST-LIO2 equations.
 enum DegenHeuristicMode { DEGEN_HEUR_HARD = 0, DEGEN_HEUR_SOFT = 1, DEGEN_HEUR_SIGMOID = 2 };
 enum DegenProbMode      { DEGEN_PROB_HEURISTIC = 0, DEGEN_PROB_PROBABILISTIC = 1 };
 
@@ -147,8 +147,8 @@ struct DegeneracyConfig
 
     // ---- Parameters for probability_mode = "probabilistic" (DRPM-style) ----
     // See drpm_degeneracy.h / reference_repos/drpm.  The computation is done
-    // in the LiDAR/IMU body frame; the resulting 6x6 A matrix is rotated back
-    // into FAST-LIO2's state convention before being applied.
+    // in the LiDAR/IMU body frame; the resulting 6x6 projectors are rotated
+    // into FAST-LIO2's state convention before being used by the IEKF solver.
     double snr_factor             = 10.0;   // signal / noise ratio threshold s
     double stdev_points           = 0.02;   // meters, per-point range noise std
     double stdev_normals          = 0.05;   // rad-equivalent, isotropic normal noise std
@@ -908,6 +908,7 @@ static bool degen_build_block_A(const Eigen::Matrix3d &Lambda_block,
                                 double sigmoid_tau,
                                 double sigmoid_s,
                                 Eigen::Matrix3d &A,
+                                Eigen::Matrix3d &B,
                                 Eigen::Vector3d &eigvals,
                                 Eigen::Vector3d &probs)
 {
@@ -931,12 +932,55 @@ static bool degen_build_block_A(const Eigen::Matrix3d &Lambda_block,
     }
 
     A = U * sqrt_p.asDiagonal() * U.transpose();
+    B = U * probs.asDiagonal() * U.transpose();
     return true;
+}
+
+static Eigen::Matrix3d degen_estimate_normal_covariance_world(const PointVector &points_near,
+                                                              double stdev_points)
+{
+    if (points_near.size() < 3 || !std::isfinite(stdev_points) || stdev_points <= 0.0)
+    {
+        return Eigen::Matrix3d::Identity() * 1e-6;
+    }
+
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    for (const auto &pt : points_near)
+        mean += Eigen::Vector3d(pt.x, pt.y, pt.z);
+    mean /= static_cast<double>(points_near.size());
+
+    Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+    for (const auto &pt : points_near)
+    {
+        const Eigen::Vector3d centered = Eigen::Vector3d(pt.x, pt.y, pt.z) - mean;
+        covariance.noalias() += centered * centered.transpose();
+    }
+    covariance /= static_cast<double>(points_near.size());
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(covariance);
+    if (es.info() != Eigen::Success || !covariance.allFinite())
+    {
+        return Eigen::Matrix3d::Identity() * 1e-6;
+    }
+
+    Eigen::Vector3d eig = es.eigenvalues();
+    const Eigen::Matrix3d &U = es.eigenvectors();
+    const double eps = std::max(stdev_points * stdev_points, 1e-9);
+    const double lambda_mid = std::max(eig(1) - stdev_points * stdev_points, eps);
+    const double lambda_max = std::max(eig(2) - stdev_points * stdev_points, eps);
+
+    Eigen::Vector3d tangent_variances;
+    tangent_variances << 0.0, 1.0 / lambda_mid, 1.0 / lambda_max;
+    return (stdev_points * stdev_points / static_cast<double>(points_near.size())) *
+           U * tangent_variances.asDiagonal() * U.transpose();
 }
 
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
+    ekfom_data.degen_mitigation_en = false;
+    ekfom_data.degen_pose_rhs_projector.setIdentity();
+    ekfom_data.degen_pose_jacobian_projector.setIdentity();
     laserCloudOri->clear(); 
     corr_normvect->clear(); 
     total_residual = 0.0; 
@@ -1014,7 +1058,9 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     
     effct_feat_num = 0;
     std::vector<float> residuals_effective;
+    std::vector<Eigen::Matrix3d> effective_normal_cov_world;
     residuals_effective.reserve(feats_down_size);
+    effective_normal_cov_world.reserve(feats_down_size);
 
     for (int i = 0; i < feats_down_size; i++)
     {
@@ -1022,6 +1068,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         {
             laserCloudOri->points[effct_feat_num] = feats_down_body->points[i];
             corr_normvect->points[effct_feat_num] = normvec->points[i];
+            effective_normal_cov_world.push_back(
+                degen_estimate_normal_covariance_world(Nearest_Points[i], g_degen_cfg.stdev_points));
             total_residual += res_last[i];
             residuals_effective.push_back(res_last[i]);
             effct_feat_num ++;
@@ -1106,7 +1154,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
         // Use only pose part: effct_feat_num x 6
         // (Assumes first 6 columns correspond to pose error-state in this implementation.)
-        if (Hfull.rows() >= 6 && Hfull.cols() >= 6)
+        if (Hfull.rows() > 0 && Hfull.cols() >= 6)
         {
             Eigen::MatrixXd Hpose = Hfull.leftCols(6);  // size: effct_feat_num x 6
 
@@ -1251,12 +1299,10 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             }
 
             // -----------------------------------------------------------------
-            // Degeneracy mitigation: H_pose <- H_pose * A, per-block
-            // A_t = U_t P_t^{1/2} U_t^T built from  Lambda_t = H_t^T H_t / sigma^2
-            // A_r = U_r P_r^{1/2} U_r^T built from  Lambda_r = H_r^T H_r / sigma^2
-            // Rotation and translation are treated as two 3x3 blocks because their
-            // eigenvalue scales differ (units, feature distances). The extrinsic
-            // columns (6..11) are left untouched.
+            // Degeneracy mitigation follows the paper's update rule
+            // x = U P Lambda^-1 U^T J^T b. We pass U P U^T to the IEKF solver
+            // for RHS attenuation and U P^{1/2} U^T for the reduced covariance
+            // information. The extrinsic columns (6..11) are left untouched.
             // -----------------------------------------------------------------
             if (g_degen_cfg.enable && ekfom_data.h_x.rows() > 0 && ekfom_data.h_x.cols() >= 6)
             {
@@ -1271,11 +1317,14 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                     //    convention:  v = [p x n; n],  H = sum w * v * v^T.
                     // 3. Eigendecompose, compute noise statistics and
                     //    per-direction non-degeneracy probabilities p_k.
-                    // 4. Build A_drpm = U * diag(sqrt(p)) * U^T.
-                    // 5. Transform A to FAST-LIO2's [trans_world, rot_body]
-                    //    convention:  A_flio = M * A_drpm * M^T,
+                    // 4. Build B_drpm = U * diag(p) * U^T for the paper's
+                    //    RHS attenuation and A_drpm = U * diag(sqrt(p)) * U^T
+                    //    for the reduced covariance/information update.
+                    // 5. Transform both to FAST-LIO2's [trans_world, rot_body]
+                    //    convention:  X_flio = M * X_drpm * M^T,
                     //    M = [0 R; I 0].
-                    // 6. Apply:  H_pose <- H_pose * A_flio.
+                    // 6. Pass the projectors to the IEKF solver. The solver
+                    //    applies x = H^{-1} B H^T r, matching Algorithm 1.
                     // =========================================================
                     const int N = effct_feat_num;
                     const double inv_R = 1.0 / std::max(LASER_POINT_COV, 1e-12);
@@ -1323,11 +1372,17 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                         const Eigen::Matrix<double, 6, 6>& V  = es_drpm.eigenvectors();
                         drpm_eigenvalues = es_drpm.eigenvalues();
 
-                        // --- Step 3b: isotropic normal covariances ---
-                        const double var_n = g_degen_cfg.stdev_normals * g_degen_cfg.stdev_normals;
+                        // --- Step 3b: per-correspondence normal covariances ---
                         degeneracy::VectorMatrix3<double> normal_covs(N);
                         for (int i = 0; i < N; ++i)
-                            normal_covs[i] = Eigen::Matrix3d::Identity() * var_n;
+                        {
+                            normal_covs[i] = R_inv * effective_normal_cov_world[i] * R_inv.transpose();
+                            if (!normal_covs[i].allFinite())
+                            {
+                                const double var_n = g_degen_cfg.stdev_normals * g_degen_cfg.stdev_normals;
+                                normal_covs[i] = Eigen::Matrix3d::Identity() * var_n;
+                            }
+                        }
 
                         // --- Step 3c: noise estimate ---
                         Eigen::Matrix<double, 6, 6> noise_mean;
@@ -1343,8 +1398,10 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
                         drpm_probs = drpm_probs.cwiseMax(0.0).cwiseMin(1.0);
 
-                        // --- Step 4: A_drpm = V * diag(sqrt(p)) * V^T ---
+                        // --- Step 4: B_drpm = V * diag(p) * V^T, A_drpm = V * diag(sqrt(p)) * V^T ---
                         Eigen::Matrix<double, 6, 1> sqrt_p = drpm_probs.cwiseSqrt();
+                        Eigen::Matrix<double, 6, 6> B_drpm =
+                            V * drpm_probs.asDiagonal() * V.transpose();
                         Eigen::Matrix<double, 6, 6> A_drpm =
                             V * sqrt_p.asDiagonal() * V.transpose();
 
@@ -1352,22 +1409,25 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                         // DRPM uses [rot(3), trans(3)] in body frame.
                         // FAST-LIO2 H_pose columns are [trans_world(3), rot_body(3)].
                         // Mapping:  x_flio = M * x_drpm,  M = [0  R; I  0].
-                        // A_flio = M * A_drpm * M^T.
-                        //   A_flio[tt] = R * A_drpm[tt] * R^T
-                        //   A_flio[tr] = R * A_drpm[tr]          (tr = bottom-left in DRPM = trans,rot)
-                        //   A_flio[rt] = A_flio[tr]^T
-                        //   A_flio[rr] = A_drpm[rr]
-                        // where A_drpm blocks are indexed as [rr(0:3,0:3), rt(0:3,3:6); tr(3:6,0:3), tt(3:6,3:6)].
+                        // X_flio = M * X_drpm * M^T for X in {A, B}.
+                        // where X_drpm blocks are indexed as [rr(0:3,0:3), rt(0:3,3:6); tr(3:6,0:3), tt(3:6,3:6)].
                         const Eigen::Matrix3d R_mat = s.rot.toRotationMatrix();
 
-                        Eigen::Matrix<double, 6, 6> A_flio;
-                        A_flio.block<3,3>(0,0) = R_mat * A_drpm.block<3,3>(3,3) * R_mat.transpose(); // trans-trans
-                        A_flio.block<3,3>(0,3) = R_mat * A_drpm.block<3,3>(3,0);                     // trans-rot
-                        A_flio.block<3,3>(3,0) = A_flio.block<3,3>(0,3).transpose();                 // rot-trans (symmetric)
-                        A_flio.block<3,3>(3,3) = A_drpm.block<3,3>(0,0);                             // rot-rot
+                        auto to_fastlio_pose_order =
+                            [&R_mat](const Eigen::Matrix<double, 6, 6> &X_drpm)
+                            {
+                                Eigen::Matrix<double, 6, 6> X_flio;
+                                X_flio.block<3,3>(0,0) = R_mat * X_drpm.block<3,3>(3,3) * R_mat.transpose();
+                                X_flio.block<3,3>(0,3) = R_mat * X_drpm.block<3,3>(3,0);
+                                X_flio.block<3,3>(3,0) = X_drpm.block<3,3>(0,3) * R_mat.transpose();
+                                X_flio.block<3,3>(3,3) = X_drpm.block<3,3>(0,0);
+                                return X_flio;
+                            };
 
-                        // --- Step 6: apply H_pose <- H_pose * A_flio ---
-                        ekfom_data.h_x.leftCols(6) = Hpose * A_flio;
+                        // --- Step 6: pass projectors to the IEKF solver ---
+                        ekfom_data.degen_mitigation_en = true;
+                        ekfom_data.degen_pose_rhs_projector = to_fastlio_pose_order(B_drpm);
+                        ekfom_data.degen_pose_jacobian_projector = to_fastlio_pose_order(A_drpm);
                     }
                     else
                     {
@@ -1398,6 +1458,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
                     Eigen::Matrix3d At = Eigen::Matrix3d::Identity();
                     Eigen::Matrix3d Ar = Eigen::Matrix3d::Identity();
+                    Eigen::Matrix3d Bt = Eigen::Matrix3d::Identity();
+                    Eigen::Matrix3d Br = Eigen::Matrix3d::Identity();
                     Eigen::Vector3d eig_t = Eigen::Vector3d::Zero();
                     Eigen::Vector3d eig_r = Eigen::Vector3d::Zero();
                     Eigen::Vector3d p_t   = Eigen::Vector3d::Ones();
@@ -1408,19 +1470,23 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                                                     g_degen_cfg.soft_alpha_trans,
                                                     g_degen_cfg.sigmoid_tau_trans,
                                                     g_degen_cfg.sigmoid_s_trans,
-                                                    At, eig_t, p_t);
+                                                    At, Bt, eig_t, p_t);
                     bool ok_r = degen_build_block_A(Lambda_r, g_degen_cfg.heur_mode,
                                                     g_degen_cfg.hard_lambda_min_rot,
                                                     g_degen_cfg.soft_alpha_rot,
                                                     g_degen_cfg.sigmoid_tau_rot,
                                                     g_degen_cfg.sigmoid_s_rot,
-                                                    Ar, eig_r, p_r);
+                                                    Ar, Br, eig_r, p_r);
 
                     if (ok_t && ok_r)
                     {
-                        // Apply in place to the Jacobian that the IEKF will consume.
-                        ekfom_data.h_x.leftCols(3)       = Hpose.leftCols(3)  * At;
-                        ekfom_data.h_x.block(0, 3, ekfom_data.h_x.rows(), 3) = Hpose.rightCols(3) * Ar;
+                        ekfom_data.degen_mitigation_en = true;
+                        ekfom_data.degen_pose_rhs_projector.setZero();
+                        ekfom_data.degen_pose_rhs_projector.block<3,3>(0,0) = Bt;
+                        ekfom_data.degen_pose_rhs_projector.block<3,3>(3,3) = Br;
+                        ekfom_data.degen_pose_jacobian_projector.setZero();
+                        ekfom_data.degen_pose_jacobian_projector.block<3,3>(0,0) = At;
+                        ekfom_data.degen_pose_jacobian_projector.block<3,3>(3,3) = Ar;
                     }
 
                     // Diagnostics: publish eigenvalues and per-direction probabilities.
