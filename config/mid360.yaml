@@ -8,6 +8,24 @@ common:
     d2_eps_min: 0.05              # Lower clamp on eps_j in meters (avoids collapse when the platform is near-static).
     d2_eps_max: 2.0               # Upper clamp on eps_j in meters (guards against runaway thresholds on bad motion estimates).
 
+dead_reckoning:
+    enable: false
+    # Seconds after first LiDAR frame. If windows is set, it overrides start_time/end_time.
+    # Use a negative end time to continue indefinitely from that window's start.
+    windows:
+        - [25.0, 45.0]
+        # - [20.0, 23.0]
+        # - [25.0, 28.0]
+        # - [30.0, 33.0]
+        # - [35.0, 38.0]
+        # - [40.0, 43.0]
+        # - [45.0, 48.0]
+        # - [50.0, 53.0]
+        # - [0.0, -1.0]
+        # - [45.0, 50.0]
+    start_time: 10.0             # Fallback if windows is omitted; 0.0 starts after IMU initialization is complete.
+    end_time: 20.0               # Fallback if windows is omitted; negative or omitted means continue indefinitely.
+
 degeneracy:
     # Probabilistic degeneracy mitigation (Week 7).  When enabled, attenuates the
     # pose update along eigen-directions judged degenerate.

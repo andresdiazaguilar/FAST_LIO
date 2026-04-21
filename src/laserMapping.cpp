@@ -40,6 +40,7 @@
 #include <iomanip>
 #include <csignal>
 #include <cerrno>
+#include <utility>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -168,6 +169,9 @@ double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_pl
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool   dead_reckoning_enable = false, dead_reckoning_was_active = false;
+double dead_reckoning_start_time = 0.0, dead_reckoning_end_time = -1.0;
+vector<pair<double, double>> dead_reckoning_windows;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -239,6 +243,34 @@ geometry_msgs::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+static bool get_xmlrpc_number(const XmlRpc::XmlRpcValue &value, double &number)
+{
+    if (value.getType() == XmlRpc::XmlRpcValue::TypeDouble)
+    {
+        number = static_cast<double>(value);
+        return true;
+    }
+    if (value.getType() == XmlRpc::XmlRpcValue::TypeInt)
+    {
+        number = static_cast<int>(value);
+        return true;
+    }
+    return false;
+}
+
+static bool dead_reckoning_time_is_active(const double relative_time)
+{
+    for (const auto &window : dead_reckoning_windows)
+    {
+        if (relative_time >= window.first &&
+            (window.second < 0.0 || relative_time < window.second))
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 void SigHandle(int sig)
 {
@@ -1596,6 +1628,64 @@ int main(int argc, char** argv)
     nh.param<bool>("common/use_d2_outlier_filter", d2_use_outlier_filter, false);
     nh.param<double>("common/d2_eps_min", d2_eps_min, 0.05);
     nh.param<double>("common/d2_eps_max", d2_eps_max, 2.0);
+    nh.param<bool>("dead_reckoning/enable", dead_reckoning_enable, false);
+    nh.param<double>("dead_reckoning/start_time", dead_reckoning_start_time, 0.0);
+    nh.param<double>("dead_reckoning/end_time", dead_reckoning_end_time, -1.0);
+    dead_reckoning_start_time = std::max(0.0, dead_reckoning_start_time);
+
+    XmlRpc::XmlRpcValue windows_param;
+    if (nh.getParam("dead_reckoning/windows", windows_param))
+    {
+        if (windows_param.getType() == XmlRpc::XmlRpcValue::TypeArray)
+        {
+            for (int i = 0; i < windows_param.size(); ++i)
+            {
+                if (windows_param[i].getType() != XmlRpc::XmlRpcValue::TypeArray ||
+                    windows_param[i].size() != 2)
+                {
+                    ROS_WARN_STREAM("Skipping invalid dead_reckoning/windows entry " << i
+                                    << "; expected [start_time, end_time].");
+                    continue;
+                }
+
+                double window_start = 0.0;
+                double window_end = -1.0;
+                if (!get_xmlrpc_number(windows_param[i][0], window_start) ||
+                    !get_xmlrpc_number(windows_param[i][1], window_end))
+                {
+                    ROS_WARN_STREAM("Skipping invalid dead_reckoning/windows entry " << i
+                                    << "; start/end must be numeric.");
+                    continue;
+                }
+
+                window_start = std::max(0.0, window_start);
+                if (window_end >= 0.0 && window_end <= window_start)
+                {
+                    ROS_WARN_STREAM("Skipping invalid dead-reckoning window [" << window_start
+                                    << ", " << window_end << "]; end_time must be after start_time.");
+                    continue;
+                }
+                dead_reckoning_windows.emplace_back(window_start, window_end);
+            }
+        }
+        else
+        {
+            ROS_WARN("dead_reckoning/windows is not an array; falling back to start_time/end_time.");
+        }
+    }
+
+    if (dead_reckoning_windows.empty())
+    {
+        if (dead_reckoning_end_time >= 0.0 && dead_reckoning_end_time <= dead_reckoning_start_time)
+        {
+            ROS_WARN_STREAM("dead_reckoning/end_time (" << dead_reckoning_end_time
+                            << " s) is not after start_time (" << dead_reckoning_start_time
+                            << " s); treating dead-reckoning as indefinite.");
+            dead_reckoning_end_time = -1.0;
+        }
+        dead_reckoning_windows.emplace_back(dead_reckoning_start_time, dead_reckoning_end_time);
+    }
+    std::sort(dead_reckoning_windows.begin(), dead_reckoning_windows.end());
 
     // ---- Degeneracy mitigation parameters ----
     nh.param<bool>("degeneracy/enable", g_degen_cfg.enable, false);
@@ -1827,6 +1917,36 @@ int main(int argc, char** argv)
             g_omega_norm_mean = omega_norm_mean;
             g_acc_norm_mean   = acc_norm_mean;
             g_acc_norm_no_grav_mean = acc_norm_no_grav_mean;
+
+            const double relative_lidar_time = Measures.lidar_beg_time - first_lidar_time;
+            const bool dead_reckoning_active =
+                dead_reckoning_enable &&
+                p_imu->IsInitialized() &&
+                dead_reckoning_time_is_active(relative_lidar_time);
+
+            if (dead_reckoning_active)
+            {
+                if (!dead_reckoning_was_active)
+                {
+                    ROS_WARN_STREAM("IMU dead-reckoning active from t="
+                                    << relative_lidar_time
+                                    << " s; skipping LiDAR IEKF updates and map insertion.");
+                    dead_reckoning_was_active = true;
+                }
+
+                euler_cur = SO3ToEuler(state_point.rot);
+                pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+                geoQuat.x = state_point.rot.coeffs()[0];
+                geoQuat.y = state_point.rot.coeffs()[1];
+                geoQuat.z = state_point.rot.coeffs()[2];
+                geoQuat.w = state_point.rot.coeffs()[3];
+
+                write_tum_trajectory_pose();
+                publish_odometry(pubOdomAftMapped);
+                if (path_en) publish_path(pubPath);
+                continue;
+            }
+            dead_reckoning_was_active = false;
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
