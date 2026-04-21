@@ -37,7 +37,11 @@
 #include <math.h>
 #include <thread>
 #include <fstream>
+#include <iomanip>
 #include <csignal>
+#include <cerrno>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <algorithm>
 #include <limits>
@@ -176,6 +180,9 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
+const string trajectory_dir = "/home/andres/semester_project/data/estimated_trajectories";
+const string trajectory_file_path = trajectory_dir + "/FAST_LIO_trajectory.txt";
+ofstream trajectory_file;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -254,6 +261,34 @@ inline void dump_lio_state_to_log(FILE *fp)
     fprintf(fp, "%lf %lf %lf ", state_point.grav[0], state_point.grav[1], state_point.grav[2]); // Bias_a  
     fprintf(fp, "\r\n");  
     fflush(fp);
+}
+
+bool ensure_directory_exists(const string &dir)
+{
+    if (mkdir(dir.c_str(), 0755) == 0 || errno == EEXIST)
+    {
+        return true;
+    }
+
+    ROS_ERROR_STREAM("Failed to create trajectory output directory: " << dir);
+    return false;
+}
+
+void write_tum_trajectory_pose()
+{
+    if (!trajectory_file.is_open())
+    {
+        return;
+    }
+
+    trajectory_file << lidar_end_time << " "
+                    << state_point.pos(0) << " "
+                    << state_point.pos(1) << " "
+                    << state_point.pos(2) << " "
+                    << geoQuat.x << " "
+                    << geoQuat.y << " "
+                    << geoQuat.z << " "
+                    << geoQuat.w << "\n";
 }
 
 void pointBodyToWorld_ikfom(PointType const * const pi, PointType * const po, state_ikfom &s)
@@ -1662,9 +1697,27 @@ int main(int argc, char** argv)
     fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
     fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
     if (fout_pre && fout_out)
+    {
         cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
+    }
     else
+    {
         cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
+    }
+
+    if (ensure_directory_exists(trajectory_dir))
+    {
+        trajectory_file.open(trajectory_file_path, ios::out | ios::trunc);
+        if (trajectory_file.is_open())
+        {
+            trajectory_file << fixed << setprecision(9);
+            ROS_INFO_STREAM("Writing FAST-LIO TUM trajectory to " << trajectory_file_path);
+        }
+        else
+        {
+            ROS_ERROR_STREAM("Failed to open FAST-LIO TUM trajectory file: " << trajectory_file_path);
+        }
+    }
 
     /*** ROS subscribe initialization ***/
     ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? \
@@ -1934,6 +1987,7 @@ int main(int argc, char** argv)
             geoQuat.y = state_point.rot.coeffs()[1];
             geoQuat.z = state_point.rot.coeffs()[2];
             geoQuat.w = state_point.rot.coeffs()[3];
+            write_tum_trajectory_pose();
 
             Eigen::Matrix<double, 3, 1> weakest_t_dir = Eigen::Matrix<double, 3, 1>::Zero();
             Eigen::Matrix<double, 3, 1> weakest_r_dir = Eigen::Matrix<double, 3, 1>::Zero();
@@ -2125,6 +2179,10 @@ int main(int argc, char** argv)
 
     fout_out.close();
     fout_pre.close();
+    if (trajectory_file.is_open())
+    {
+        trajectory_file.close();
+    }
 
     if (runtime_pos_log)
     {
