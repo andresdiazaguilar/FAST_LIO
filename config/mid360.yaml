@@ -5,15 +5,16 @@ common:
     time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
                                   # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
     use_d2_outlier_filter: false  # Enable D^2-LIO adaptive per-point outlier threshold (Eq. 7) in place of FAST-LIO2's s>0.9 gate.
-    d2_eps_min: 0.05              # Lower clamp on eps_j in meters (avoids collapse when the platform is near-static).
+    d2_eps_min: 0.0              # Lower clamp on eps_j in meters (avoids collapse when the platform is near-static).
     d2_eps_max: 2.0               # Upper clamp on eps_j in meters (guards against runaway thresholds on bad motion estimates).
 
 dead_reckoning:
-    enable: false
+    enable: true
     # Seconds after first LiDAR frame. If windows is set, it overrides start_time/end_time.
     # Use a negative end time to continue indefinitely from that window's start.
     windows:
-        - [25.0, 45.0]
+        - [20.0, -1.0]   # Start immediately and continue indefinitely.
+        # - [25.0, 45.0]
         # - [20.0, 23.0]
         # - [25.0, 28.0]
         # - [30.0, 33.0]
@@ -32,8 +33,8 @@ degeneracy:
     # DRPM update rule: x = U P Lambda^-1 U^T J^T b, P = diag(p_1..p_6), p_k in [0,1].
     # With enable=false, the filter is byte-identical to baseline FAST-LIO2.
     enable: false
-    force_all_probabilities_one: true  # true: force all p_k=1 while keeping mitigation path active for testing
-    probability_mode: "probabilistic"   # "heuristic" | "probabilistic"
+    force_all_probabilities_one: false  # true: force all p_k=1 while keeping mitigation path active for testing
+    probability_mode: "heuristic"   # "heuristic" | "probabilistic"
     heuristic_mode:   "soft"        # "hard" | "soft" | "sigmoid"
     # Hard-threshold mode: p_k = 1 if lambda_k > lambda_min else 0
     hard_lambda_min_trans: 100.0
