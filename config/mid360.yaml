@@ -9,7 +9,7 @@ common:
     d2_eps_max: 2.0               # Upper clamp on eps_j in meters (guards against runaway thresholds on bad motion estimates).
 
 dead_reckoning:
-    enable: true
+    enable: false
     # Seconds after first LiDAR frame. If windows is set, it overrides start_time/end_time.
     # Use a negative end time to continue indefinitely from that window's start.
     windows:
@@ -79,6 +79,6 @@ publish:
     scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
 
 pcd_save:
-    pcd_save_en: true
+    pcd_save_en: false
     interval: -1                 # how many LiDAR frames saved in each pcd file; 
                                  # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

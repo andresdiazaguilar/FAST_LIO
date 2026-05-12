@@ -184,8 +184,10 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
-const string trajectory_dir = "/home/andres/semester_project/data/estimated_trajectories";
-const string trajectory_file_path = trajectory_dir + "/FAST_LIO_trajectory.txt";
+const string default_trajectory_dir = "/home/andres/semester_project/data/estimated_trajectories";
+const string default_trajectory_file_path = default_trajectory_dir + "/FAST_LIO_trajectory.txt";
+string trajectory_dir = default_trajectory_dir;
+string trajectory_file_path = default_trajectory_file_path;
 ofstream trajectory_file;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -1741,6 +1743,11 @@ int main(int argc, char** argv)
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+    nh.param<string>("trajectory_file_path", trajectory_file_path, default_trajectory_file_path);
+    {
+        size_t slash = trajectory_file_path.find_last_of('/');
+        trajectory_dir = (slash == string::npos) ? string(".") : trajectory_file_path.substr(0, slash);
+    }
 
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;

@@ -2,8 +2,10 @@
 <!-- Launch file for Livox AVIA LiDAR -->
 
 	<arg name="rviz" default="true" />
+	<arg name="trajectory_file_path" default="/home/andres/semester_project/data/estimated_trajectories/FAST_LIO_trajectory.txt" />
 
 	<rosparam command="load" file="$(find fast_lio)/config/avia.yaml" />
+	<param name="trajectory_file_path" type="string" value="$(arg trajectory_file_path)" />
 
 	<param name="feature_extract_enable" type="bool" value="0"/>
 	<param name="point_filter_num" type="int" value="3"/>
